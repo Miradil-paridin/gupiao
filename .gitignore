@@ -1,0 +1,82 @@
+############################
+# Python / Build artifacts
+############################
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+develop-eggs/
+downloads/
+eggs/
+.eggs/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+*.egg
+.installed.cfg
+pip-wheel-metadata/
+*.whl
+
+############################
+# Virtual environments
+############################
+.venv/
+venv/
+ENV/
+env/
+
+############################
+# IDE / Editor
+############################
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+*.tmp
+
+############################
+# OS junk
+############################
+.DS_Store
+Thumbs.db
+
+############################
+# Jupyter
+############################
+.ipynb_checkpoints/
+
+############################
+# Project generated outputs
+############################
+# Main generated folders (your repo big stuff)
+data/
+out/
+
+# Logs (if any get written outside data/)
+*.log
+logs/
+
+# Optional: caches
+.cache/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+############################
+# Parquet files (in case any appear outside data/)
+############################
+*.parquet
+
+############################
+# CSV handling (IMPORTANT)
+############################
+# DO NOT ignore all CSV globally (so you can still commit templates/examples under docs/ or samples/)
+# But ignore CSV generated under data/ and out/ (even if you later stop ignoring the whole folder)
+data/**/*.csv
+out/**/*.csv

@@ -1,0 +1,38 @@
+strategy:
+  top_k: 15
+  invest_more_n: 15
+  pullback_min_pct: 0.1
+  pullback_max_pct: 0.3
+  use_limit_up_pullback: true
+  use_tdx_indicators: true
+  use_tradeability_filter: true
+  use_volatility_sizing: true
+  max_single_weight: 0.15
+  max_total_position: 0.8
+  use_market_regime: true
+  industry_diversification:
+    enabled: true
+    max_per_industry: 2
+  market_cap_filter:
+    enabled: true
+    min_float_mkt_cap: 8000000000.0
+    max_float_mkt_cap: 800000000000.0
+  liquidity_filter:
+    enabled: true
+    min_amount_20d: 60000000.0
+    min_turnover_20d: 0.6
+  correlation_control:
+    enabled: true
+    corr_lookback_days: 60
+    max_pairwise_corr: 0.75
+risk_control:
+  stop_loss_pct: 0.06
+  trailing_stop_pct: 0.08
+  max_hold_days: 15
+  use_stop_loss: true
+  use_trailing_stop: true
+  use_time_stop: true
+backtest:
+  initial_capital: 100000.0
+  cost_bps: 15.0
+  start_date: '2023-01-01'
