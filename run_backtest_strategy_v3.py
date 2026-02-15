@@ -689,14 +689,6 @@ def run_backtest_v3(
 
         daily_targets[prev_date] = target_symbols
 
-        # ── 当日持仓收益（先记已有仓位收益，再执行收盘调仓）──
-        daily_ret_row = returns_df.loc[date] if date in returns_df.index else pd.Series(dtype=float)
-        gross_ret = 0.0
-        total_weight = 0.0
-        for sym, pos in positions.items():
-            gross_ret += pos["weight"] * float(daily_ret_row.get(sym, 0.0))
-            total_weight += pos["weight"]
-
         # ── 退出逻辑（方案3升级）──
         to_sell: list[str] = []
         for sym, pos in positions.items():
@@ -861,6 +853,13 @@ def run_backtest_v3(
                 scale = max_pos_today / total_w
                 for s in active_targets:
                     positions[s]["weight"] *= scale
+
+        daily_ret_row = returns_df.loc[date] if date in returns_df.index else pd.Series(dtype=float)
+        gross_ret = 0.0
+        total_weight = 0.0
+        for sym, pos in positions.items():
+            gross_ret += pos["weight"] * float(daily_ret_row.get(sym, 0.0))
+            total_weight += pos["weight"]
 
         turnover = 0.10 if len(target_symbols) > 0 else 0.0
         cost = turnover * (cfg.cost_bps / 10000.0)
@@ -1821,9 +1820,13 @@ def main() -> None:
         for k, v in result["files"].items():
             print(f"{k}: {v}")
     else:
+        # 默认自动检测精选回测股票池
         wl_file = args.watchlist
         if wl_file is None:
-            print("  📋 未指定 --watchlist，默认使用全股票池（更接近真实历史回测）")
+            auto_wl = base_dir / "backtest_watchlist.yaml"
+            if auto_wl.exists():
+                wl_file = "backtest_watchlist.yaml"
+                print(f"  📋 自动检测到精选回测股票池: {wl_file}")
         run_quick_backtest(
             base_dir,
             start_date=start_date,
