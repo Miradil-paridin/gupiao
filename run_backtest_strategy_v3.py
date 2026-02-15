@@ -658,6 +658,11 @@ def run_backtest_v3(
             if allowed is not None:
                 prev_day = prev_day[prev_day["symbol"].isin(allowed)].copy()
 
+        if allowed_symbols_by_date:
+            allowed = allowed_symbols_by_date.get(prev_date)
+            if allowed is not None:
+                prev_day = prev_day[prev_day["symbol"].isin(allowed)]
+
         # ── 方案1: 指数风控开关 ──
         index_allow = idx_filter.get(prev_date, True) if idx_filter else True
 
@@ -1857,6 +1862,10 @@ def main() -> None:
         wl_file = args.watchlist
         if wl_file is None:
             print("  📋 未指定 --watchlist，默认使用全股票池（更接近真实历史回测）")
+            auto_wl = base_dir / "backtest_watchlist.yaml"
+            if auto_wl.exists():
+                wl_file = "backtest_watchlist.yaml"
+                print(f"  📋 自动检测到精选回测股票池: {wl_file}")
         run_quick_backtest(
             base_dir,
             start_date=start_date,
