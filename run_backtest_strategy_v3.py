@@ -650,12 +650,11 @@ def run_backtest_v3(
         prev_day = by_date.get(prev_date)
         if prev_day is None or prev_day.empty:
             continue
-        prev_day = prev_day.copy()
 
         if allowed_symbols_by_date:
             allowed = allowed_symbols_by_date.get(prev_date)
             if allowed is not None:
-                prev_day = prev_day[prev_day["symbol"].isin(allowed)].copy()
+                prev_day = prev_day[prev_day["symbol"].isin(allowed)]
 
         # ── 方案1: 指数风控开关 ──
         index_allow = idx_filter.get(prev_date, True) if idx_filter else True
@@ -689,14 +688,6 @@ def run_backtest_v3(
             signal_strengths = {}
 
         daily_targets[prev_date] = target_symbols
-
-        # ── 当日持仓收益（先记已有仓位收益，再执行收盘调仓）──
-        prev_weights = {sym: float(pos.get("weight", 0.0)) for sym, pos in positions.items()}
-
-        daily_ret_row = returns_df.loc[date] if date in returns_df.index else pd.Series(dtype=float)
-        gross_ret = 0.0
-        for sym, pos in positions.items():
-            gross_ret += pos["weight"] * float(daily_ret_row.get(sym, 0.0))
 
         # ── 退出逻辑（方案3升级）──
         to_sell: list[str] = []
@@ -863,16 +854,17 @@ def run_backtest_v3(
                 for s in active_targets:
                     positions[s]["weight"] *= scale
 
-        # 真实调仓换手：基于日内调仓前后权重差计算
-        new_weights = {sym: float(pos.get("weight", 0.0)) for sym, pos in positions.items()}
-        all_syms = set(prev_weights) | set(new_weights)
-        turnover = float(sum(abs(new_weights.get(s, 0.0) - prev_weights.get(s, 0.0)) for s in all_syms))
+        daily_ret_row = returns_df.loc[date] if date in returns_df.index else pd.Series(dtype=float)
+        gross_ret = 0.0
+        total_weight = 0.0
+        for sym, pos in positions.items():
+            gross_ret += pos["weight"] * float(daily_ret_row.get(sym, 0.0))
+            total_weight += pos["weight"]
 
+        turnover = 0.10 if len(target_symbols) > 0 else 0.0
         cost = turnover * (cfg.cost_bps / 10000.0)
         net_ret = gross_ret - cost
         equity *= 1.0 + net_ret
-
-        total_weight = float(sum(float(pos.get("weight", 0.0)) for pos in positions.values()))
 
         rec.append(
             {
@@ -1435,7 +1427,7 @@ def run_optimization_pipeline(base_dir: Path, start_date: str) -> dict[str, Any]
 
     param_grid = {
         "top_k": [5, 10, 15, 20],
-        "invest_more_n": [5, 10, 15, 20, 25],
+        "invest_more_n": [3, 5, 10, 15],
         "pullback_min_pct": [0.03, 0.05, 0.07, 0.10],
         "pullback_max_pct": [0.20, 0.25, 0.30, 0.35],
         "stop_loss_pct": [0.06, 0.08, 0.10, 0.12],
@@ -1828,9 +1820,13 @@ def main() -> None:
         for k, v in result["files"].items():
             print(f"{k}: {v}")
     else:
+        # 默认自动检测精选回测股票池
         wl_file = args.watchlist
         if wl_file is None:
-            print("  📋 未指定 --watchlist，默认使用全股票池（更接近真实历史回测）")
+            auto_wl = base_dir / "backtest_watchlist.yaml"
+            if auto_wl.exists():
+                wl_file = "backtest_watchlist.yaml"
+                print(f"  📋 自动检测到精选回测股票池: {wl_file}")
         run_quick_backtest(
             base_dir,
             start_date=start_date,
