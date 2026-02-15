@@ -466,6 +466,7 @@ def _candidate_entry_mask(day: pd.DataFrame, cfg: BacktestConfigV3) -> pd.Series
     - normal:  多路径灵活入场
     - loose:   仅需 trend_up
     """
+    day = day.copy()
     mode = cfg.entry_mode.lower()
 
     if mode == "custom":
@@ -541,7 +542,7 @@ def _candidate_entry_mask(day: pd.DataFrame, cfg: BacktestConfigV3) -> pd.Series
         signal_strength = signal_strength.where(~strong, 2.0)    # strong=2
         signal_strength = signal_strength.where(~normal_sig, 1.0)  # normal=1
         signal_strength = signal_strength.where(~weak, 0.5)        # weak=0.5
-        day["_signal_strength"] = signal_strength
+        day.loc[:, "_signal_strength"] = signal_strength
 
         return mask
 
@@ -608,6 +609,7 @@ def run_backtest_v3(
     date_start: pd.Timestamp | None = None,
     date_end: pd.Timestamp | None = None,
     index_filter: dict | None = None,
+    allowed_symbols_by_date: dict[pd.Timestamp, set[str]] | None = None,
 ) -> dict[str, Any]:
     ddf = daily_universe.copy()
     ddf["date"] = pd.to_datetime(ddf["date"])
@@ -649,11 +651,17 @@ def run_backtest_v3(
         prev_day = by_date.get(prev_date)
         if prev_day is None or prev_day.empty:
             continue
+        prev_day = prev_day.copy()
+
+        if allowed_symbols_by_date:
+            allowed = allowed_symbols_by_date.get(prev_date)
+            if allowed is not None:
+                prev_day = prev_day[prev_day["symbol"].isin(allowed)].copy()
 
         # ── 方案1: 指数风控开关 ──
         index_allow = idx_filter.get(prev_date, True) if idx_filter else True
 
-        if index_allow:
+        if index_allow and not prev_day.empty:
             mask = _candidate_entry_mask(prev_day, cfg)
             cands = _apply_enhancement_filters(prev_day[mask].copy(), cfg).sort_values(
                 "score", ascending=False
@@ -677,11 +685,19 @@ def run_backtest_v3(
                 for _, row in cands.iterrows():
                     signal_strengths[str(row["symbol"])] = float(row.get("_signal_strength", 1.0))
         else:
-            # 指数不允许开仓 → 空目标（只做风控卖出，不新开仓）
+            # 指数不允许开仓或当日可选池为空 → 空目标（只做风控卖出，不新开仓）
             target_symbols = []
             signal_strengths = {}
 
         daily_targets[prev_date] = target_symbols
+
+        # ── 当日持仓收益（先记已有仓位收益，再执行收盘调仓）──
+        prev_weights = {sym: float(pos.get("weight", 0.0)) for sym, pos in positions.items()}
+
+        daily_ret_row = returns_df.loc[date] if date in returns_df.index else pd.Series(dtype=float)
+        gross_ret = 0.0
+        for sym, pos in positions.items():
+            gross_ret += pos["weight"] * float(daily_ret_row.get(sym, 0.0))
 
         # ── 退出逻辑（方案3升级）──
         to_sell: list[str] = []
@@ -848,17 +864,16 @@ def run_backtest_v3(
                 for s in active_targets:
                     positions[s]["weight"] *= scale
 
-        daily_ret_row = returns_df.loc[date] if date in returns_df.index else pd.Series(dtype=float)
-        gross_ret = 0.0
-        total_weight = 0.0
-        for sym, pos in positions.items():
-            gross_ret += pos["weight"] * float(daily_ret_row.get(sym, 0.0))
-            total_weight += pos["weight"]
+        # 真实调仓换手：基于日内调仓前后权重差计算
+        new_weights = {sym: float(pos.get("weight", 0.0)) for sym, pos in positions.items()}
+        all_syms = set(prev_weights) | set(new_weights)
+        turnover = float(sum(abs(new_weights.get(s, 0.0) - prev_weights.get(s, 0.0)) for s in all_syms))
 
-        turnover = 0.10 if len(target_symbols) > 0 else 0.0
         cost = turnover * (cfg.cost_bps / 10000.0)
         net_ret = gross_ret - cost
         equity *= 1.0 + net_ret
+
+        total_weight = float(sum(float(pos.get("weight", 0.0)) for pos in positions.values()))
 
         rec.append(
             {
@@ -1123,6 +1138,63 @@ def summarize_metrics(equity_df: pd.DataFrame, initial_capital: float) -> dict[s
     }
 
 
+def build_dynamic_watchlist_by_date(
+    daily_universe: pd.DataFrame,
+    max_symbols: int = 200,
+    rebalance_freq: str = "M",
+) -> dict[pd.Timestamp, set[str]]:
+    """基于历史截面的条件，按月/周动态构建可交易股票池（避免用当下固定池回测全历史）。"""
+    ddf = daily_universe.copy()
+    ddf["date"] = pd.to_datetime(ddf["date"])
+    ddf = ddf.sort_values(["date", "symbol"]).reset_index(drop=True)
+
+    dates = sorted(ddf["date"].unique().tolist())
+    if not dates:
+        return {}
+
+    dates_df = pd.DataFrame({"date": pd.to_datetime(dates)})
+    dates_df["period"] = dates_df["date"].dt.to_period(rebalance_freq)
+    rebalance_dates = set(dates_df.groupby("period")["date"].max().tolist())
+
+    result: dict[pd.Timestamp, set[str]] = {}
+    current_universe: set[str] | None = None
+
+    for d in dates:
+        day = ddf[ddf["date"] == d].copy()
+        if day.empty:
+            continue
+
+        if d in rebalance_dates or current_universe is None:
+            # 与自动选股逻辑保持一致：涨停活跃 + 主力控盘为正 + 高30创新高
+            strict_mask = (
+                (day["has_limit_up_30d_calc"].fillna(0) >= 1)
+                & (day["main_force_pct"].fillna(0) > 0.005)
+                & (day["high30_new_high"].fillna(0) == 1)
+            )
+            cands = day[strict_mask].copy()
+
+            # 候选不足时，放宽到去掉创新高条件，防止池子过空
+            if len(cands) < max_symbols // 3:
+                loose_mask = (
+                    (day["has_limit_up_30d_calc"].fillna(0) >= 1)
+                    & (day["main_force_pct"].fillna(0) > 0)
+                )
+                cands = day[loose_mask].copy()
+
+            if cands.empty:
+                cands = day.copy()
+
+            cands = cands.sort_values(
+                ["tdx_score", "amount_20d", "turnover_20d"],
+                ascending=[False, False, False],
+            )
+            current_universe = set(cands.head(max_symbols)["symbol"].astype(str).tolist())
+
+        result[pd.to_datetime(d)] = current_universe or set()
+
+    return result
+
+
 def to_html_table(df: pd.DataFrame) -> str:
     if df.empty:
         return "<p>(empty)</p>"
@@ -1364,7 +1436,7 @@ def run_optimization_pipeline(base_dir: Path, start_date: str) -> dict[str, Any]
 
     param_grid = {
         "top_k": [5, 10, 15, 20],
-        "invest_more_n": [3, 5, 10, 15],
+        "invest_more_n": [5, 10, 15, 20, 25],
         "pullback_min_pct": [0.03, 0.05, 0.07, 0.10],
         "pullback_max_pct": [0.20, 0.25, 0.30, 0.35],
         "stop_loss_pct": [0.06, 0.08, 0.10, 0.12],
@@ -1540,7 +1612,18 @@ def _load_cfg_from_yaml(base_dir: Path) -> BacktestConfigV3:
     )
 
 
-def run_quick_backtest(base_dir: Path, start_date: str, watchlist_file: str = None) -> None:
+def run_quick_backtest(
+    base_dir: Path,
+    start_date: str,
+    watchlist_file: str = None,
+    use_dynamic_watchlist: bool = False,
+    dynamic_top_n: int = 200,
+    top_k_override: int | None = None,
+    invest_more_n_override: int | None = None,
+    min_float_mkt_cap_override: float | None = None,
+    min_amount_20d_override: float | None = None,
+    min_turnover_20d_override: float | None = None,
+) -> None:
     """快速回测：读取配置文件参数，直接跑一次全区间回测并输出结果"""
     print("=" * 60)
     print("📊 策略 V3 回测")
@@ -1548,6 +1631,18 @@ def run_quick_backtest(base_dir: Path, start_date: str, watchlist_file: str = No
 
     print("\n[1/6] 加载配置...")
     cfg = _load_cfg_from_yaml(base_dir)
+    # ── 轻量参数覆盖（用于快速A/B验证，不改主配置）──
+    if top_k_override is not None:
+        cfg = BacktestConfigV3(**{**asdict(cfg), "top_k": int(top_k_override)})
+    if invest_more_n_override is not None:
+        cfg = BacktestConfigV3(**{**asdict(cfg), "invest_more_n": int(invest_more_n_override)})
+    if min_float_mkt_cap_override is not None:
+        cfg = BacktestConfigV3(**{**asdict(cfg), "min_float_mkt_cap": float(min_float_mkt_cap_override)})
+    if min_amount_20d_override is not None:
+        cfg = BacktestConfigV3(**{**asdict(cfg), "min_amount_20d": float(min_amount_20d_override)})
+    if min_turnover_20d_override is not None:
+        cfg = BacktestConfigV3(**{**asdict(cfg), "min_turnover_20d": float(min_turnover_20d_override)})
+
     print(f"  入场模式: {cfg.entry_mode} (附加条件≥{cfg.normal_min_conditions})")
     print(f"  止损: {cfg.stop_loss_pct*100:.0f}% | 止盈: {cfg.trailing_stop_pct*100:.0f}% | 时间: {cfg.max_hold_days}天")
     print(f"  ATR止损: {'开' if cfg.use_atr_stop else '关'} ({cfg.atr_stop_multiplier}x)")
@@ -1556,6 +1651,11 @@ def run_quick_backtest(base_dir: Path, start_date: str, watchlist_file: str = No
     print(f"  信号分级仓位: {'开' if cfg.use_signal_tiered_sizing else '关'}")
     print(f"  盈利加仓: {'开' if cfg.use_profit_pyramiding else '关'} (>{cfg.pyramid_trigger_pct*100:.0f}%加{cfg.pyramid_add_ratio*100:.0f}%)")
     print(f"  TDX保护: {'开' if cfg.use_tdx_protection else '关'}")
+    print(f"  top_k/invest_more_n: {cfg.top_k}/{cfg.invest_more_n}")
+    print(f"  流动性门槛: amount20d≥{cfg.min_amount_20d:.2e}, turnover20d≥{cfg.min_turnover_20d:.2f}")
+    print(f"  市值门槛: float_mkt_cap≥{cfg.min_float_mkt_cap:.2e}")
+    if use_dynamic_watchlist:
+        print(f"  动态股票池: 开 (按月重平衡, Top {dynamic_top_n})")
 
     print("\n[2/6] 加载数据...")
     feats = load_and_prepare_features(base_dir, start_date=start_date)
@@ -1608,6 +1708,17 @@ def run_quick_backtest(base_dir: Path, start_date: str, watchlist_file: str = No
 
     print("\n[3/6] 预计算...")
     daily = precompute_daily_universe(feats)
+    dynamic_watchlist_map: dict[pd.Timestamp, set[str]] | None = None
+    if use_dynamic_watchlist:
+        dynamic_watchlist_map = build_dynamic_watchlist_by_date(
+            daily_universe=daily,
+            max_symbols=dynamic_top_n,
+            rebalance_freq="M",
+        )
+        if dynamic_watchlist_map:
+            sample_date = sorted(dynamic_watchlist_map.keys())[0]
+            sample_n = len(dynamic_watchlist_map[sample_date])
+            print(f"  🎯 动态池样例: {str(sample_date)[:10]} 有 {sample_n} 只")
     price_df = feats.pivot_table(index="date", columns="symbol", values="close").sort_index()
     returns_df = price_df.pct_change(fill_method=None).fillna(0.0)
     regime_df = compute_market_regime(feats)
@@ -1644,6 +1755,7 @@ def run_quick_backtest(base_dir: Path, start_date: str, watchlist_file: str = No
         date_start=pd.to_datetime(start_date),
         date_end=daily["date"].max(),
         index_filter=index_filter,
+        allowed_symbols_by_date=dynamic_watchlist_map,
     )
 
     eq = result["equity_curve"]
@@ -1698,6 +1810,15 @@ def main() -> None:
     ap.add_argument("--optimize", action="store_true", help="run full grid-search optimization")
     ap.add_argument("--watchlist", default=None,
                      help="指定回测股票池文件 (如 backtest_watchlist.yaml)，不指定则用全部股票")
+    ap.add_argument("--dynamic-watchlist", action="store_true",
+                    help="启用动态股票池（按月重平衡），避免用当下静态池回测全历史")
+    ap.add_argument("--dynamic-top-n", type=int, default=200,
+                    help="动态股票池每期保留数量（默认200）")
+    ap.add_argument("--top-k", type=int, default=None, help="临时覆盖 top_k（用于A/B测试）")
+    ap.add_argument("--invest-more-n", type=int, default=None, help="临时覆盖 invest_more_n（用于A/B测试）")
+    ap.add_argument("--min-float-mkt-cap", type=float, default=None, help="临时覆盖最小流通市值门槛")
+    ap.add_argument("--min-amount-20d", type=float, default=None, help="临时覆盖20日均成交额门槛")
+    ap.add_argument("--min-turnover-20d", type=float, default=None, help="临时覆盖20日均换手率门槛")
     args = ap.parse_args()
 
     base_dir = Path(args.base_dir).resolve()
@@ -1733,14 +1854,21 @@ def main() -> None:
         for k, v in result["files"].items():
             print(f"{k}: {v}")
     else:
-        # 默认自动检测精选回测股票池
         wl_file = args.watchlist
         if wl_file is None:
-            auto_wl = base_dir / "backtest_watchlist.yaml"
-            if auto_wl.exists():
-                wl_file = "backtest_watchlist.yaml"
-                print(f"  📋 自动检测到精选回测股票池: {wl_file}")
-        run_quick_backtest(base_dir, start_date=start_date, watchlist_file=wl_file)
+            print("  📋 未指定 --watchlist，默认使用全股票池（更接近真实历史回测）")
+        run_quick_backtest(
+            base_dir,
+            start_date=start_date,
+            watchlist_file=wl_file,
+            use_dynamic_watchlist=bool(args.dynamic_watchlist),
+            dynamic_top_n=int(args.dynamic_top_n),
+            top_k_override=args.top_k,
+            invest_more_n_override=args.invest_more_n,
+            min_float_mkt_cap_override=args.min_float_mkt_cap,
+            min_amount_20d_override=args.min_amount_20d,
+            min_turnover_20d_override=args.min_turnover_20d,
+        )
 
 
 if __name__ == "__main__":
