@@ -608,6 +608,7 @@ def run_backtest_v3(
     date_start: pd.Timestamp | None = None,
     date_end: pd.Timestamp | None = None,
     index_filter: dict | None = None,
+    allowed_symbols_by_date: dict[pd.Timestamp, set[str]] | None = None,
 ) -> dict[str, Any]:
     ddf = daily_universe.copy()
     ddf["date"] = pd.to_datetime(ddf["date"])
@@ -650,10 +651,15 @@ def run_backtest_v3(
         if prev_day is None or prev_day.empty:
             continue
 
+        if allowed_symbols_by_date:
+            allowed = allowed_symbols_by_date.get(prev_date)
+            if allowed is not None:
+                prev_day = prev_day[prev_day["symbol"].isin(allowed)]
+
         # ── 方案1: 指数风控开关 ──
         index_allow = idx_filter.get(prev_date, True) if idx_filter else True
 
-        if index_allow:
+        if index_allow and not prev_day.empty:
             mask = _candidate_entry_mask(prev_day, cfg)
             cands = _apply_enhancement_filters(prev_day[mask].copy(), cfg).sort_values(
                 "score", ascending=False
@@ -677,7 +683,7 @@ def run_backtest_v3(
                 for _, row in cands.iterrows():
                     signal_strengths[str(row["symbol"])] = float(row.get("_signal_strength", 1.0))
         else:
-            # 指数不允许开仓 → 空目标（只做风控卖出，不新开仓）
+            # 指数不允许开仓或当日可选池为空 → 空目标（只做风控卖出，不新开仓）
             target_symbols = []
             signal_strengths = {}
 
@@ -1123,6 +1129,63 @@ def summarize_metrics(equity_df: pd.DataFrame, initial_capital: float) -> dict[s
     }
 
 
+def build_dynamic_watchlist_by_date(
+    daily_universe: pd.DataFrame,
+    max_symbols: int = 200,
+    rebalance_freq: str = "M",
+) -> dict[pd.Timestamp, set[str]]:
+    """基于历史截面的条件，按月/周动态构建可交易股票池（避免用当下固定池回测全历史）。"""
+    ddf = daily_universe.copy()
+    ddf["date"] = pd.to_datetime(ddf["date"])
+    ddf = ddf.sort_values(["date", "symbol"]).reset_index(drop=True)
+
+    dates = sorted(ddf["date"].unique().tolist())
+    if not dates:
+        return {}
+
+    dates_df = pd.DataFrame({"date": pd.to_datetime(dates)})
+    dates_df["period"] = dates_df["date"].dt.to_period(rebalance_freq)
+    rebalance_dates = set(dates_df.groupby("period")["date"].max().tolist())
+
+    result: dict[pd.Timestamp, set[str]] = {}
+    current_universe: set[str] | None = None
+
+    for d in dates:
+        day = ddf[ddf["date"] == d].copy()
+        if day.empty:
+            continue
+
+        if d in rebalance_dates or current_universe is None:
+            # 与自动选股逻辑保持一致：涨停活跃 + 主力控盘为正 + 高30创新高
+            strict_mask = (
+                (day["has_limit_up_30d_calc"].fillna(0) >= 1)
+                & (day["main_force_pct"].fillna(0) > 0.005)
+                & (day["high30_new_high"].fillna(0) == 1)
+            )
+            cands = day[strict_mask].copy()
+
+            # 候选不足时，放宽到去掉创新高条件，防止池子过空
+            if len(cands) < max_symbols // 3:
+                loose_mask = (
+                    (day["has_limit_up_30d_calc"].fillna(0) >= 1)
+                    & (day["main_force_pct"].fillna(0) > 0)
+                )
+                cands = day[loose_mask].copy()
+
+            if cands.empty:
+                cands = day.copy()
+
+            cands = cands.sort_values(
+                ["tdx_score", "amount_20d", "turnover_20d"],
+                ascending=[False, False, False],
+            )
+            current_universe = set(cands.head(max_symbols)["symbol"].astype(str).tolist())
+
+        result[pd.to_datetime(d)] = current_universe or set()
+
+    return result
+
+
 def to_html_table(df: pd.DataFrame) -> str:
     if df.empty:
         return "<p>(empty)</p>"
@@ -1540,7 +1603,13 @@ def _load_cfg_from_yaml(base_dir: Path) -> BacktestConfigV3:
     )
 
 
-def run_quick_backtest(base_dir: Path, start_date: str, watchlist_file: str = None) -> None:
+def run_quick_backtest(
+    base_dir: Path,
+    start_date: str,
+    watchlist_file: str = None,
+    use_dynamic_watchlist: bool = False,
+    dynamic_top_n: int = 200,
+) -> None:
     """快速回测：读取配置文件参数，直接跑一次全区间回测并输出结果"""
     print("=" * 60)
     print("📊 策略 V3 回测")
@@ -1556,6 +1625,8 @@ def run_quick_backtest(base_dir: Path, start_date: str, watchlist_file: str = No
     print(f"  信号分级仓位: {'开' if cfg.use_signal_tiered_sizing else '关'}")
     print(f"  盈利加仓: {'开' if cfg.use_profit_pyramiding else '关'} (>{cfg.pyramid_trigger_pct*100:.0f}%加{cfg.pyramid_add_ratio*100:.0f}%)")
     print(f"  TDX保护: {'开' if cfg.use_tdx_protection else '关'}")
+    if use_dynamic_watchlist:
+        print(f"  动态股票池: 开 (按月重平衡, Top {dynamic_top_n})")
 
     print("\n[2/6] 加载数据...")
     feats = load_and_prepare_features(base_dir, start_date=start_date)
@@ -1608,6 +1679,17 @@ def run_quick_backtest(base_dir: Path, start_date: str, watchlist_file: str = No
 
     print("\n[3/6] 预计算...")
     daily = precompute_daily_universe(feats)
+    dynamic_watchlist_map: dict[pd.Timestamp, set[str]] | None = None
+    if use_dynamic_watchlist:
+        dynamic_watchlist_map = build_dynamic_watchlist_by_date(
+            daily_universe=daily,
+            max_symbols=dynamic_top_n,
+            rebalance_freq="M",
+        )
+        if dynamic_watchlist_map:
+            sample_date = sorted(dynamic_watchlist_map.keys())[0]
+            sample_n = len(dynamic_watchlist_map[sample_date])
+            print(f"  🎯 动态池样例: {str(sample_date)[:10]} 有 {sample_n} 只")
     price_df = feats.pivot_table(index="date", columns="symbol", values="close").sort_index()
     returns_df = price_df.pct_change(fill_method=None).fillna(0.0)
     regime_df = compute_market_regime(feats)
@@ -1644,6 +1726,7 @@ def run_quick_backtest(base_dir: Path, start_date: str, watchlist_file: str = No
         date_start=pd.to_datetime(start_date),
         date_end=daily["date"].max(),
         index_filter=index_filter,
+        allowed_symbols_by_date=dynamic_watchlist_map,
     )
 
     eq = result["equity_curve"]
@@ -1698,6 +1781,10 @@ def main() -> None:
     ap.add_argument("--optimize", action="store_true", help="run full grid-search optimization")
     ap.add_argument("--watchlist", default=None,
                      help="指定回测股票池文件 (如 backtest_watchlist.yaml)，不指定则用全部股票")
+    ap.add_argument("--dynamic-watchlist", action="store_true",
+                    help="启用动态股票池（按月重平衡），避免用当下静态池回测全历史")
+    ap.add_argument("--dynamic-top-n", type=int, default=200,
+                    help="动态股票池每期保留数量（默认200）")
     args = ap.parse_args()
 
     base_dir = Path(args.base_dir).resolve()
@@ -1740,7 +1827,13 @@ def main() -> None:
             if auto_wl.exists():
                 wl_file = "backtest_watchlist.yaml"
                 print(f"  📋 自动检测到精选回测股票池: {wl_file}")
-        run_quick_backtest(base_dir, start_date=start_date, watchlist_file=wl_file)
+        run_quick_backtest(
+            base_dir,
+            start_date=start_date,
+            watchlist_file=wl_file,
+            use_dynamic_watchlist=bool(args.dynamic_watchlist),
+            dynamic_top_n=int(args.dynamic_top_n),
+        )
 
 
 if __name__ == "__main__":
