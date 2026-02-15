@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 import argparse
@@ -58,6 +57,47 @@ class BacktestConfigV3:
     use_correlation_control: bool = True
     corr_lookback_days: int = 60
     max_pairwise_corr: float = 0.75
+
+    # entry mode: "custom" / "strict" / "normal" / "loose"
+    entry_mode: str = "normal"
+
+    # TDX protection: relax stop-loss for strong main-force stocks
+    use_tdx_protection: bool = True
+    tdx_protection_threshold: float = 2.0
+
+    # ── 方案1: 指数风控开关 ──
+    use_index_filter: bool = True
+    index_ma_period: int = 60          # 指数均线周期
+    index_ma_short: int = 20           # 短期均线（判断拐头）
+    index_crash_days: int = 3          # 近N天跌幅检测
+    index_crash_threshold: float = -0.03  # 跌幅超此值暂停开仓
+    index_pause_days: int = 5          # 暂停开仓天数
+
+    # ── 方案2A: 普通路径 2-of-3 ──
+    normal_min_conditions: int = 2     # 附加条件至少满足几个
+
+    # ── 方案2B: 信号强度分级仓位 ──
+    use_signal_tiered_sizing: bool = True
+    tier_strong_multiplier: float = 1.2   # 强信号仓位倍数
+    tier_normal_multiplier: float = 1.0   # 普通信号
+    tier_weak_multiplier: float = 0.5     # 弱信号
+
+    # ── 方案3: 退出规则升级 ──
+    use_atr_stop: bool = True
+    atr_stop_multiplier: float = 1.5   # 止损 = 入场价 - N * ATR
+
+    use_failure_stop: bool = True
+    failure_stop_days: int = 2         # 入场后N天内跌回突破位
+    failure_stop_gain: float = 0.03    # N天内涨幅不足此值视为失败
+
+    # 优化时间止损
+    time_stop_min_gain: float = 0.0    # 持仓到期时，至少要有此涨幅才不被砍
+
+    # ── 方案4: 盈利加仓 ──
+    use_profit_pyramiding: bool = True
+    pyramid_trigger_pct: float = 0.05  # 浮盈超过5%触发加仓
+    pyramid_add_ratio: float = 0.5     # 加仓量 = 原仓位 * 0.5
+    pyramid_max_adds: int = 1          # 最多加仓次数
 
 
 @dataclass(frozen=True)
@@ -171,14 +211,48 @@ def load_and_prepare_features(base_dir: Path, start_date: str) -> pd.DataFrame:
     merged["atr_pct"] = merged["atr_14"] / merged["close"].replace(0, np.nan)
     merged["atr_pct"] = merged["atr_pct"].fillna(0.01).clip(lower=0.003, upper=0.25)
 
+    # ── 月线级别指标（用户自定义通达信公式）──
+    # 主力控盘公式: GU1=(C*2+H+L)/4; 起爆=EMA(EMA(C,9),9); 主力控盘=(GU1-REF(起爆,1))/REF(起爆,1)
+    merged["_gu1"] = (merged["close"] * 2 + merged["high"] + merged["low"]) / 4.0
+    merged["_ema9"] = merged.groupby("symbol")["close"].transform(lambda s: s.ewm(span=9, adjust=False).mean())
+    merged["_ema9_9"] = merged.groupby("symbol")["_ema9"].transform(lambda s: s.ewm(span=9, adjust=False).mean())
+    merged["_qibao_prev"] = merged.groupby("symbol")["_ema9_9"].shift(1)
+    merged["main_force_pct"] = (merged["_gu1"] - merged["_qibao_prev"]) / merged["_qibao_prev"].replace(0, np.nan)
+    merged["main_force_pct"] = merged["main_force_pct"].fillna(0)
+
+    # 高30公式: X1=(C+L+H)/1.5; X2=EMA(X1,3); 高30=HHV(X2,30); 条件:高30>前高30
+    merged["_x1"] = (merged["close"] + merged["low"] + merged["high"]) / 1.5
+    merged["_x2"] = merged.groupby("symbol")["_x1"].transform(lambda s: s.ewm(span=3, adjust=False).mean())
+    merged["_high30"] = merged.groupby("symbol")["_x2"].transform(lambda s: s.rolling(30, min_periods=10).max())
+    merged["_high30_prev"] = merged.groupby("symbol")["_high30"].shift(1)
+    merged["high30_new_high"] = (merged["_high30"] > merged["_high30_prev"]).astype(int)
+
+    # 30天内有涨停: 涨幅>9.5%的天数
+    merged["_is_limit_up"] = (merged["close"] / merged.groupby("symbol")["close"].shift(1) > 1.095).astype(int)
+    merged["has_limit_up_30d_calc"] = merged.groupby("symbol")["_is_limit_up"].transform(
+        lambda s: s.rolling(30, min_periods=1).sum()
+    )
+    merged["has_limit_up_30d_calc"] = (merged["has_limit_up_30d_calc"] >= 1).astype(int)
+
+    # 清理临时列
+    drop_cols = [c for c in merged.columns if c.startswith("_")]
+    merged.drop(columns=drop_cols, inplace=True, errors="ignore")
+
     return merged
 
 
 def build_industry_map_from_config(base_dir: Path, symbols: pd.Series) -> dict[str, str]:
-    cfg_path = base_dir / "config.yaml"
     mapping: dict[str, str] = {}
 
-    if cfg_path.exists():
+    # 尝试多个配置文件
+    cfg_path = None
+    for name in ["config_v31.yaml", "config_optimized.yaml", "config.yaml"]:
+        p = base_dir / name
+        if p.exists():
+            cfg_path = p
+            break
+
+    if cfg_path is not None:
         text = cfg_path.read_text(encoding="utf-8", errors="ignore")
         current_group = "GROUP_0"
         group_id = 0
@@ -235,6 +309,9 @@ def precompute_daily_universe(df: pd.DataFrame) -> pd.DataFrame:
         "float_mkt_cap_20d",
         "amount",
         "turnover",
+        "main_force_pct",
+        "high30_new_high",
+        "has_limit_up_30d_calc",
     ]
     for col in required_fill_zero:
         if col not in df.columns:
@@ -310,16 +387,163 @@ def compute_market_regime(df: pd.DataFrame) -> pd.DataFrame:
     return mkt
 
 
+def compute_index_filter(base_dir: Path, start_date: str, cfg: BacktestConfigV3) -> dict:
+    """
+    方案1: 指数风控开关
+    返回 {date: True/False}，True=允许开仓，False=暂停开仓
+    """
+    if not cfg.use_index_filter:
+        return {}
+
+    # 尝试加载沪深300指数
+    idx_path = base_dir / "data" / "index" / "hs300_daily.parquet"
+    if not idx_path.exists():
+        # 如果没有本地指数数据，尝试用BaoStock获取
+        try:
+            import baostock as bs
+            lg = bs.login()
+            try:
+                rs = bs.query_history_k_data_plus("sh.000300", "date,close",
+                    start_date, "", "d", "3")
+                rows = []
+                while rs.next():
+                    rows.append(rs.get_row_data())
+                if not rows:
+                    print("  ⚠ 无法获取指数数据，跳过指数风控")
+                    return {}
+                idx = pd.DataFrame(rows, columns=rs.fields)
+                idx["date"] = pd.to_datetime(idx["date"])
+                idx["close"] = pd.to_numeric(idx["close"], errors="coerce")
+            finally:
+                bs.logout()
+        except Exception as e:
+            print(f"  ⚠ 获取指数数据失败: {e}，跳过指数风控")
+            return {}
+    else:
+        idx = pd.read_parquet(idx_path)
+        idx["date"] = pd.to_datetime(idx["date"])
+
+    idx = idx.sort_values("date").reset_index(drop=True)
+
+    # 计算均线
+    idx["ma_long"] = idx["close"].rolling(cfg.index_ma_period, min_periods=20).mean()
+    idx["ma_short"] = idx["close"].rolling(cfg.index_ma_short, min_periods=10).mean()
+    idx["ma_short_prev"] = idx["ma_short"].shift(1)
+
+    # 指数趋势: 收盘>MA60 且 MA20上拐
+    idx["trend_ok"] = (idx["close"] > idx["ma_long"]) & (idx["ma_short"] > idx["ma_short_prev"])
+
+    # 近N天跌幅检测
+    idx["ret_n"] = idx["close"].pct_change(cfg.index_crash_days)
+    idx["crash"] = idx["ret_n"] < cfg.index_crash_threshold
+
+    # 暴跌后暂停N天
+    idx["pause_until"] = pd.NaT
+    pause_end = pd.NaT
+    pause_flags = []
+    for i, row in idx.iterrows():
+        if row["crash"]:
+            pause_end = row["date"] + pd.Timedelta(days=cfg.index_pause_days * 1.5)  # 交易日≈1.5倍自然日
+        is_paused = pd.notna(pause_end) and row["date"] <= pause_end
+        pause_flags.append(is_paused)
+    idx["is_paused"] = pause_flags
+
+    # 最终：趋势OK 且 不在暂停期
+    idx["allow_open"] = idx["trend_ok"].fillna(False) & ~idx["is_paused"]
+
+    result = dict(zip(idx["date"], idx["allow_open"]))
+    allow_days = sum(1 for v in result.values() if v)
+    total_days = len(result)
+    print(f"  ✓ 指数风控: {allow_days}/{total_days} 天允许开仓 ({allow_days/max(total_days,1)*100:.0f}%)")
+    return result
+
+
 def _candidate_entry_mask(day: pd.DataFrame, cfg: BacktestConfigV3) -> pd.Series:
+    """
+    入场模式：
+    - custom:  用户自定义必要条件（月线级别5条件全部满足）
+    - strict:  必须 (涨停回调全套 OR TDX高分) AND trend_up
+    - normal:  多路径灵活入场
+    - loose:   仅需 trend_up
+    """
+    mode = cfg.entry_mode.lower()
+
+    if mode == "custom":
+        # ── 用户自定义：5个月线级别必要条件全部AND ──
+        # 1. 30天内有涨停
+        cond_limit_up = day["has_limit_up_30d_calc"].fillna(0) >= 1
+        # 2. 主力控盘 > 0.5% (GU1偏离起爆线)
+        cond_main_force = day["main_force_pct"].fillna(0) > 0.005
+        # 3. 高30创新高
+        cond_high30 = day["high30_new_high"].fillna(0) == 1
+        # 4. 回调 10%-30%
+        cond_pullback = (day["pullback_pct"].fillna(0) >= cfg.pullback_min_pct) & (
+            day["pullback_pct"].fillna(0) <= cfg.pullback_max_pct
+        )
+        # 5. TDX评分 >= 1.5
+        cond_tdx = day["tdx_score"].fillna(0) >= cfg.tdx_min_score
+
+        return cond_limit_up & cond_main_force & cond_high30 & cond_pullback & cond_tdx
+
+    # ── 基础条件计算 ──
     in_window = (day["days_since_limit_up"] >= cfg.pullback_window_start) & (
         day["days_since_limit_up"] <= cfg.pullback_window_end
     )
-    pullback_ok = (day["pullback_pct"] >= cfg.pullback_min_pct) & (day["pullback_pct"] <= cfg.pullback_max_pct)
-    breakout_ok = (day["volume_breakout"].fillna(0) == 1) & (day["price_above_ma5"].fillna(0) == 1)
+    pullback_ok = (day["pullback_pct"] >= cfg.pullback_min_pct) & (
+        day["pullback_pct"] <= cfg.pullback_max_pct
+    )
+    breakout_ok = (day["volume_breakout"].fillna(0) == 1) & (
+        day["price_above_ma5"].fillna(0) == 1
+    )
     tdx_ok = (day["tdx_score"].fillna(0) >= cfg.tdx_min_score) | (
         (day["high30_breakout"].fillna(0) == 1) & (day["main_force_strong"].fillna(0) == 1)
     )
-    return in_window & pullback_ok & breakout_ok & tdx_ok & (day["trend_up"] == 1)
+    trend_up = day["trend_up"] == 1
+
+    # ── 涨停回调完整条件 ──
+    limit_up_pullback = in_window & pullback_ok
+
+    if mode == "strict":
+        core_signal = (limit_up_pullback & breakout_ok) | tdx_ok
+        return core_signal & trend_up
+
+    elif mode == "loose":
+        return trend_up
+
+    else:  # "normal" (默认) - 方案2A: 2-of-3 + 信号强度分级
+        # 附加条件计数: breakout_ok, tdx_ok, trend_up
+        extra_count = (
+            breakout_ok.astype(int)
+            + tdx_ok.astype(int)
+            + trend_up.astype(int)
+        )
+
+        # 路径1: 涨停回调 + 附加条件≥2 (2-of-3)
+        path_pullback = limit_up_pullback & (extra_count >= cfg.normal_min_conditions)
+
+        # 路径2: TDX高分 + trend_up (强信号)
+        path_tdx = tdx_ok & trend_up
+
+        # 路径3: 放量突破 + trend_up + 主力控盘 (需要更多验证)
+        path_breakout = breakout_ok & trend_up & (day["main_force_strong"].fillna(0) == 1)
+
+        mask = path_pullback | path_tdx | path_breakout
+
+        # ── 方案2B: 信号强度分级（存到 DataFrame 供仓位分配用）──
+        signal_strength = pd.Series(0.0, index=day.index)
+        # 强信号: 涨停回调 + TDX + 趋势 全满足
+        strong = limit_up_pullback & tdx_ok & trend_up
+        # 普通信号: 路径2或路径1
+        normal_sig = (path_tdx | path_pullback) & ~strong
+        # 弱信号: 仅路径3
+        weak = path_breakout & ~strong & ~normal_sig
+
+        signal_strength = signal_strength.where(~strong, 2.0)    # strong=2
+        signal_strength = signal_strength.where(~normal_sig, 1.0)  # normal=1
+        signal_strength = signal_strength.where(~weak, 0.5)        # weak=0.5
+        day["_signal_strength"] = signal_strength
+
+        return mask
 
 
 def _apply_enhancement_filters(day: pd.DataFrame, cfg: BacktestConfigV3) -> pd.DataFrame:
@@ -383,6 +607,7 @@ def run_backtest_v3(
     regime_df: pd.DataFrame | None = None,
     date_start: pd.Timestamp | None = None,
     date_end: pd.Timestamp | None = None,
+    index_filter: dict | None = None,
 ) -> dict[str, Any]:
     ddf = daily_universe.copy()
     ddf["date"] = pd.to_datetime(ddf["date"])
@@ -410,11 +635,13 @@ def run_backtest_v3(
         regime_pos = dict(zip(rr["date"], rr["regime_pos_cap"]))
 
     by_date = {d: g for d, g in ddf.groupby("date", sort=True)}
+    idx_filter = index_filter or {}
 
     equity = cfg.initial_capital
     positions: dict[str, dict[str, float]] = {}
     rec: list[dict[str, Any]] = []
     daily_targets: dict[pd.Timestamp, list[str]] = {}
+    trade_log: list[dict[str, Any]] = []  # 交易记录
 
     for i in range(1, len(trading_days)):
         prev_date = trading_days[i - 1]
@@ -423,24 +650,40 @@ def run_backtest_v3(
         if prev_day is None or prev_day.empty:
             continue
 
-        mask = _candidate_entry_mask(prev_day, cfg)
-        cands = _apply_enhancement_filters(prev_day[mask].copy(), cfg).sort_values("score", ascending=False).head(
-            cfg.invest_more_n
-        )
+        # ── 方案1: 指数风控开关 ──
+        index_allow = idx_filter.get(prev_date, True) if idx_filter else True
 
-        if cfg.use_correlation_control:
-            ret_window = returns_df.loc[
-                (returns_df.index < prev_date)
-                & (returns_df.index >= prev_date - pd.Timedelta(days=cfg.corr_lookback_days * 2))
-            ]
-            if len(ret_window) > cfg.corr_lookback_days:
-                ret_window = ret_window.tail(cfg.corr_lookback_days)
+        if index_allow:
+            mask = _candidate_entry_mask(prev_day, cfg)
+            cands = _apply_enhancement_filters(prev_day[mask].copy(), cfg).sort_values(
+                "score", ascending=False
+            ).head(cfg.invest_more_n)
+
+            if cfg.use_correlation_control:
+                ret_window = returns_df.loc[
+                    (returns_df.index < prev_date)
+                    & (returns_df.index >= prev_date - pd.Timedelta(days=cfg.corr_lookback_days * 2))
+                ]
+                if len(ret_window) > cfg.corr_lookback_days:
+                    ret_window = ret_window.tail(cfg.corr_lookback_days)
+            else:
+                ret_window = returns_df.iloc[:0]
+
+            target_symbols = _corr_guard_select(cands, cfg.top_k, cfg, ret_window)
+
+            # 获取信号强度（方案2B）
+            signal_strengths: dict[str, float] = {}
+            if "_signal_strength" in prev_day.columns:
+                for _, row in cands.iterrows():
+                    signal_strengths[str(row["symbol"])] = float(row.get("_signal_strength", 1.0))
         else:
-            ret_window = returns_df.iloc[:0]
+            # 指数不允许开仓 → 空目标（只做风控卖出，不新开仓）
+            target_symbols = []
+            signal_strengths = {}
 
-        target_symbols = _corr_guard_select(cands, cfg.top_k, cfg, ret_window)
         daily_targets[prev_date] = target_symbols
 
+        # ── 退出逻辑（方案3升级）──
         to_sell: list[str] = []
         for sym, pos in positions.items():
             if sym not in price_df.columns or date not in price_df.index:
@@ -457,32 +700,98 @@ def run_backtest_v3(
                 pos["peak_price"] = float(px)
 
             pnl_pct = (float(px) - pos["entry_price"]) / pos["entry_price"]
-            if pnl_pct <= -cfg.stop_loss_pct:
+
+            # (1) 硬止损（含TDX保护）
+            effective_stop = cfg.stop_loss_pct
+            if cfg.use_tdx_protection and pos.get("tdx_score", 0) >= cfg.tdx_protection_threshold:
+                effective_stop = max(cfg.stop_loss_pct, 0.08)
+            if pnl_pct <= -effective_stop:
                 to_sell.append(sym)
                 continue
 
+            # (2) ATR止损（方案3）
+            if cfg.use_atr_stop and pos.get("atr_val", 0) > 0:
+                atr_stop_price = pos["entry_price"] - cfg.atr_stop_multiplier * pos["atr_val"]
+                if float(px) <= atr_stop_price:
+                    to_sell.append(sym)
+                    continue
+
+            # (3) 失败形态止损（方案3）: 入场后N天内涨幅不足，证伪出局
+            if cfg.use_failure_stop and pos["hold_days"] <= cfg.failure_stop_days:
+                if pos["hold_days"] == cfg.failure_stop_days and pnl_pct < cfg.failure_stop_gain:
+                    to_sell.append(sym)
+                    continue
+
+            # (4) 移动止盈
             drawdown = (pos["peak_price"] - float(px)) / max(pos["peak_price"], 1e-12)
-            if drawdown >= cfg.trailing_stop_pct:
+            # 动态移动止盈: 赚得越多，止盈线越紧
+            effective_trail = cfg.trailing_stop_pct
+            if pnl_pct > 0.10:  # 浮盈>10%时收紧到6%
+                effective_trail = min(cfg.trailing_stop_pct, 0.06)
+            elif pnl_pct > 0.05:  # 浮盈>5%时收紧到8%
+                effective_trail = min(cfg.trailing_stop_pct, 0.08)
+            if drawdown >= effective_trail:
                 to_sell.append(sym)
                 continue
 
-            if pos["hold_days"] >= cfg.max_hold_days:
+            # (5) 时间止损（优化）: 到期且无明确盈利则清
+            if pos["hold_days"] >= cfg.max_hold_days and pnl_pct < cfg.time_stop_min_gain:
                 to_sell.append(sym)
                 continue
+
+            # ── 方案4: 盈利加仓 ──
+            if cfg.use_profit_pyramiding and pnl_pct >= cfg.pyramid_trigger_pct:
+                adds = pos.get("pyramid_adds", 0)
+                if adds < cfg.pyramid_max_adds:
+                    add_w = pos["weight"] * cfg.pyramid_add_ratio
+                    pos["weight"] = pos["weight"] + add_w
+                    pos["pyramid_adds"] = adds + 1
 
         for sym in to_sell:
-            positions.pop(sym, None)
+            pos = positions.pop(sym, None)
+            if pos is not None:
+                exit_px = float(price_df.at[date, sym]) if (sym in price_df.columns and date in price_df.index) else pos["entry_price"]
+                pnl = (exit_px - pos["entry_price"]) / pos["entry_price"] * 100
+                trade_log.append({
+                    "symbol": sym,
+                    "entry_date": str(pos.get("entry_date", "")),
+                    "exit_date": str(date)[:10],
+                    "entry_price": round(pos["entry_price"], 2),
+                    "exit_price": round(exit_px, 2),
+                    "hold_days": int(pos["hold_days"]),
+                    "pnl_pct": round(pnl, 2),
+                    "weight": round(pos["weight"] * 100, 1),
+                })
 
-        for sym in list(positions.keys()):
-            if sym not in target_symbols:
-                positions.pop(sym, None)
+        # 指数允许时才保留在目标里的持仓，否则逐步清仓
+        if index_allow:
+            for sym in list(positions.keys()):
+                if sym not in target_symbols:
+                    pos = positions.pop(sym)
+                    exit_px = float(price_df.at[date, sym]) if (sym in price_df.columns and date in price_df.index) else pos["entry_price"]
+                    pnl = (exit_px - pos["entry_price"]) / pos["entry_price"] * 100
+                    trade_log.append({
+                        "symbol": sym,
+                        "entry_date": str(pos.get("entry_date", "")),
+                        "exit_date": str(date)[:10],
+                        "entry_price": round(pos["entry_price"], 2),
+                        "exit_price": round(exit_px, 2),
+                        "hold_days": int(pos["hold_days"]),
+                        "pnl_pct": round(pnl, 2),
+                        "weight": round(pos["weight"] * 100, 1),
+                    })
 
+        # ── 仓位分配（方案2B: 信号分级）──
         max_pos_today = cfg.max_total_position
         if cfg.use_market_regime:
             max_pos_today = min(max_pos_today, float(regime_pos.get(prev_date, cfg.max_total_position)))
 
+        # 指数风控减半仓位
+        if not index_allow:
+            max_pos_today *= 0.3  # 熊市仅保留30%已有仓位
+
         n_targets = max(1, len(target_symbols))
-        equal_w = min(max_pos_today / n_targets, cfg.max_single_weight)
+        base_w = min(max_pos_today / n_targets, cfg.max_single_weight)
 
         for sym in target_symbols:
             if sym in positions:
@@ -492,13 +801,52 @@ def run_backtest_v3(
             px = price_df.at[date, sym]
             if not np.isfinite(px) or px <= 0:
                 continue
-            positions[sym] = {"entry_price": float(px), "peak_price": float(px), "hold_days": 0.0, "weight": float(equal_w)}
 
+            # 信号分级仓位
+            if cfg.use_signal_tiered_sizing:
+                strength = signal_strengths.get(sym, 1.0)
+                if strength >= 2.0:
+                    w = base_w * cfg.tier_strong_multiplier
+                elif strength >= 1.0:
+                    w = base_w * cfg.tier_normal_multiplier
+                else:
+                    w = base_w * cfg.tier_weak_multiplier
+                w = min(w, cfg.max_single_weight)
+            else:
+                w = base_w
+
+            # 获取ATR用于ATR止损
+            atr_val = 0.0
+            if cfg.use_atr_stop and sym in prev_day["symbol"].values:
+                atr_row = prev_day.loc[prev_day["symbol"] == sym, "atr_pct"]
+                if not atr_row.empty:
+                    atr_val = float(atr_row.iloc[0]) * float(px)
+
+            tdx_val = 0.0
+            if sym in prev_day["symbol"].values:
+                tdx_row = prev_day.loc[prev_day["symbol"] == sym, "tdx_score"]
+                if not tdx_row.empty:
+                    tdx_val = float(tdx_row.iloc[0])
+
+            positions[sym] = {
+                "entry_price": float(px),
+                "peak_price": float(px),
+                "hold_days": 0.0,
+                "weight": float(w),
+                "tdx_score": tdx_val,
+                "atr_val": atr_val,
+                "pyramid_adds": 0,
+                "entry_date": str(date)[:10],
+            }
+
+        # 重新平衡权重
         active_targets = [s for s in target_symbols if s in positions]
         if len(active_targets) > 0:
-            new_w = min(max_pos_today / len(active_targets), cfg.max_single_weight)
-            for s in active_targets:
-                positions[s]["weight"] = float(new_w)
+            total_w = sum(positions[s]["weight"] for s in active_targets)
+            if total_w > max_pos_today:
+                scale = max_pos_today / total_w
+                for s in active_targets:
+                    positions[s]["weight"] *= scale
 
         daily_ret_row = returns_df.loc[date] if date in returns_df.index else pd.Series(dtype=float)
         gross_ret = 0.0
@@ -527,7 +875,7 @@ def run_backtest_v3(
     eq = pd.DataFrame(rec)
     if eq.empty:
         metrics = {"annual_return_pct": 0.0, "max_drawdown_pct": 0.0, "sharpe": 0.0, "win_rate_pct": 0.0}
-        return {"metrics": metrics, "equity_curve": eq, "daily_targets": daily_targets}
+        return {"metrics": metrics, "equity_curve": eq, "daily_targets": daily_targets, "trade_log": trade_log}
 
     nav = eq["equity"] / cfg.initial_capital
     r = eq["daily_return"]
@@ -537,7 +885,7 @@ def run_backtest_v3(
         "sharpe": _sharpe(r),
         "win_rate_pct": _win_rate(r) * 100.0,
     }
-    return {"metrics": metrics, "equity_curve": eq, "daily_targets": daily_targets}
+    return {"metrics": metrics, "equity_curve": eq, "daily_targets": daily_targets, "trade_log": trade_log}
 
 
 def evaluate_params_cv(
@@ -1124,36 +1472,275 @@ def run_optimization_pipeline(base_dir: Path, start_date: str) -> dict[str, Any]
     }
 
 
+def _load_cfg_from_yaml(base_dir: Path) -> BacktestConfigV3:
+    """从 config_v31.yaml / config.yaml 读取参数构建 BacktestConfigV3"""
+    for name in ["config_v31.yaml", "config_optimized.yaml", "config.yaml"]:
+        p = base_dir / name
+        if p.exists():
+            with open(p, "r", encoding="utf-8") as f:
+                raw = yaml.safe_load(f) or {}
+            print(f"  ✓ 配置: {name}")
+            break
+    else:
+        print("  ⚠ 未找到配置文件，使用默认参数")
+        return BacktestConfigV3()
+
+    s = raw.get("strategy", {})
+    r = raw.get("risk_control", {})
+    b = raw.get("backtest", {})
+    ind = s.get("industry_diversification", {})
+    mc = s.get("market_cap_filter", {})
+    liq = s.get("liquidity_filter", {})
+    corr = s.get("correlation_control", {})
+
+    return BacktestConfigV3(
+        top_k=int(s.get("top_k", 15)),
+        invest_more_n=int(s.get("invest_more_n", 15)),
+        pullback_window_start=int(s.get("pullback_window_start", 3)),
+        pullback_window_end=int(s.get("pullback_window_end", 10)),
+        pullback_min_pct=float(s.get("pullback_min_pct", 0.10)),
+        pullback_max_pct=float(s.get("pullback_max_pct", 0.30)),
+        tdx_min_score=float(s.get("tdx_min_score", 1.5)),
+        stop_loss_pct=float(r.get("stop_loss_pct", 0.06)),
+        trailing_stop_pct=float(r.get("trailing_stop_pct", 0.08)),
+        max_hold_days=int(r.get("max_hold_days", 15)),
+        initial_capital=float(b.get("initial_capital", 100000.0)),
+        max_total_position=float(s.get("max_total_position", 0.80)),
+        max_single_weight=float(s.get("max_single_weight", 0.15)),
+        cost_bps=float(b.get("cost_bps", 15.0)),
+        use_market_regime=s.get("use_market_regime", True),
+        use_tradeability_filter=s.get("use_tradeability_filter", True),
+        use_industry_diversification=ind.get("enabled", True),
+        max_per_industry=int(ind.get("max_per_industry", 2)),
+        use_market_cap_filter=mc.get("enabled", True),
+        min_float_mkt_cap=float(mc.get("min_float_mkt_cap", 8e9)),
+        max_float_mkt_cap=float(mc.get("max_float_mkt_cap", 8e11)),
+        use_liquidity_filter=liq.get("enabled", True),
+        min_amount_20d=float(liq.get("min_amount_20d", 6e7)),
+        min_turnover_20d=float(liq.get("min_turnover_20d", 0.6)),
+        use_correlation_control=corr.get("enabled", True),
+        corr_lookback_days=int(corr.get("corr_lookback_days", 60)),
+        max_pairwise_corr=float(corr.get("max_pairwise_corr", 0.75)),
+        entry_mode=str(s.get("entry_mode", "normal")),
+        use_tdx_protection=bool(r.get("use_tdx_protection", True)),
+        tdx_protection_threshold=float(r.get("tdx_protection_threshold", 2.0)),
+        # 新增参数（使用默认值即可，配置文件中可选覆盖）
+        use_index_filter=bool(r.get("use_index_filter", True)),
+        index_ma_period=int(r.get("index_ma_period", 60)),
+        index_ma_short=int(r.get("index_ma_short", 20)),
+        normal_min_conditions=int(s.get("normal_min_conditions", 2)),
+        use_signal_tiered_sizing=bool(s.get("use_signal_tiered_sizing", True)),
+        use_atr_stop=bool(r.get("use_atr_stop", True)),
+        atr_stop_multiplier=float(r.get("atr_stop_multiplier", 1.5)),
+        use_failure_stop=bool(r.get("use_failure_stop", True)),
+        failure_stop_days=int(r.get("failure_stop_days", 2)),
+        failure_stop_gain=float(r.get("failure_stop_gain", 0.03)),
+        use_profit_pyramiding=bool(s.get("use_profit_pyramiding", True)),
+        pyramid_trigger_pct=float(s.get("pyramid_trigger_pct", 0.05)),
+    )
+
+
+def run_quick_backtest(base_dir: Path, start_date: str, watchlist_file: str = None) -> None:
+    """快速回测：读取配置文件参数，直接跑一次全区间回测并输出结果"""
+    print("=" * 60)
+    print("📊 策略 V3 回测")
+    print("=" * 60)
+
+    print("\n[1/6] 加载配置...")
+    cfg = _load_cfg_from_yaml(base_dir)
+    print(f"  入场模式: {cfg.entry_mode} (附加条件≥{cfg.normal_min_conditions})")
+    print(f"  止损: {cfg.stop_loss_pct*100:.0f}% | 止盈: {cfg.trailing_stop_pct*100:.0f}% | 时间: {cfg.max_hold_days}天")
+    print(f"  ATR止损: {'开' if cfg.use_atr_stop else '关'} ({cfg.atr_stop_multiplier}x)")
+    print(f"  失败形态止损: {'开' if cfg.use_failure_stop else '关'} ({cfg.failure_stop_days}天内涨幅<{cfg.failure_stop_gain*100:.0f}%)")
+    print(f"  指数风控: {'开' if cfg.use_index_filter else '关'} (MA{cfg.index_ma_period}+MA{cfg.index_ma_short})")
+    print(f"  信号分级仓位: {'开' if cfg.use_signal_tiered_sizing else '关'}")
+    print(f"  盈利加仓: {'开' if cfg.use_profit_pyramiding else '关'} (>{cfg.pyramid_trigger_pct*100:.0f}%加{cfg.pyramid_add_ratio*100:.0f}%)")
+    print(f"  TDX保护: {'开' if cfg.use_tdx_protection else '关'}")
+
+    print("\n[2/6] 加载数据...")
+    feats = load_and_prepare_features(base_dir, start_date=start_date)
+
+    # ── 股票池过滤 ──
+    if watchlist_file:
+        wl_path = base_dir / watchlist_file
+        if wl_path.exists():
+            import re as _re
+            wl_text = wl_path.read_text(encoding="utf-8")
+
+            # 尝试两种格式：
+            # 1) yaml列表格式: - "600519" 或 - 600519
+            # 2) watchlist_cache.yaml格式: ['601198', '600015', ...]
+            raw_codes = _re.findall(r'(\d{6})', wl_text)
+
+            # 也尝试直接用yaml解析（watchlist_cache.yaml格式）
+            if not raw_codes:
+                try:
+                    wl_data = yaml.safe_load(wl_text) or {}
+                    wl_list = wl_data.get("watchlist", [])
+                    raw_codes = [str(c).split(".")[0] for c in wl_list if str(c).strip()]
+                except Exception:
+                    pass
+
+            # 去重
+            raw_codes = list(set(raw_codes))
+
+            # 转换为带后缀格式
+            wl_symbols = set()
+            for code in raw_codes:
+                code = code.zfill(6)
+                if code.startswith(("6", "5")):
+                    wl_symbols.add(f"{code}.SH")
+                else:
+                    wl_symbols.add(f"{code}.SZ")
+
+            # 过滤掉指数代码（399xxx等）
+            wl_symbols = {s for s in wl_symbols if not s.startswith("399")}
+
+            before = feats["symbol"].nunique()
+            feats = feats[feats["symbol"].isin(wl_symbols)].copy()
+            after = feats["symbol"].nunique()
+            print(f"  🎯 回测股票池: {watchlist_file} ({after}/{before} 只，池子{len(wl_symbols)}只)")
+        else:
+            print(f"  ⚠️ 股票池文件不存在: {wl_path}，使用全部股票")
+    industry_map = build_industry_map_from_config(base_dir, feats["symbol"])
+    feats["industry"] = feats["symbol"].map(industry_map).fillna("OTHER")
+    print(f"  特征: {len(feats)} 行, {feats['symbol'].nunique()} 只, {feats['date'].min().date()} → {feats['date'].max().date()}")
+
+    print("\n[3/6] 预计算...")
+    daily = precompute_daily_universe(feats)
+    price_df = feats.pivot_table(index="date", columns="symbol", values="close").sort_index()
+    returns_df = price_df.pct_change(fill_method=None).fillna(0.0)
+    regime_df = compute_market_regime(feats)
+
+    print("\n[4/6] 指数风控...")
+    index_filter = compute_index_filter(base_dir, start_date, cfg)
+
+    print("\n[5/6] 运行回测...")
+    # 诊断：检查入场条件能筛出多少股票
+    if cfg.entry_mode == "custom":
+        sample_dates = sorted(daily["date"].unique())
+        check_dates = sample_dates[::60][:5]  # 每60天取一个样本
+        print(f"  [诊断] custom模式各条件命中率（抽样{len(check_dates)}天）:")
+        for cd in check_dates:
+            dd = daily[daily["date"] == cd]
+            if dd.empty:
+                continue
+            n = len(dd)
+            c1 = (dd["has_limit_up_30d_calc"].fillna(0) >= 1).sum()
+            c2 = (dd["main_force_pct"].fillna(0) > 0.005).sum()
+            c3 = (dd["high30_new_high"].fillna(0) == 1).sum()
+            c4 = ((dd["pullback_pct"].fillna(0) >= cfg.pullback_min_pct) & (dd["pullback_pct"].fillna(0) <= cfg.pullback_max_pct)).sum()
+            c5 = (dd["tdx_score"].fillna(0) >= cfg.tdx_min_score).sum()
+            mask = _candidate_entry_mask(dd, cfg)
+            call = mask.sum()
+            print(f"    {str(cd)[:10]}: 总{n}只 | 涨停30d={c1} | 主力>{0.5}%={c2} | 高30新高={c3} | 回调OK={c4} | TDX≥{cfg.tdx_min_score}={c5} | 全部通过={call}")
+
+    result = run_backtest_v3(
+        daily_universe=daily,
+        price_df=price_df,
+        returns_df=returns_df,
+        cfg=cfg,
+        regime_df=regime_df,
+        date_start=pd.to_datetime(start_date),
+        date_end=daily["date"].max(),
+        index_filter=index_filter,
+    )
+
+    eq = result["equity_curve"]
+    m = result["metrics"]
+    trades = result.get("trade_log", [])
+
+    print(f"\n  年化收益: {m['annual_return_pct']:+.2f}%")
+    print(f"  最大回撤: {m['max_drawdown_pct']:.2f}%")
+    print(f"  夏普比率: {m['sharpe']:.2f}")
+    print(f"  胜    率: {m['win_rate_pct']:.1f}%")
+
+    if trades:
+        tdf = pd.DataFrame(trades)
+        n_trades = len(tdf)
+        n_symbols = tdf["symbol"].nunique()
+        wins = (tdf["pnl_pct"] > 0).sum()
+        avg_pnl = tdf["pnl_pct"].mean()
+        print(f"  交易次数: {n_trades} | 涉及股票: {n_symbols}只 | 交易胜率: {wins/n_trades*100:.1f}% | 平均盈亏: {avg_pnl:+.2f}%")
+
+    if not eq.empty:
+        has_trades = (eq["n_holdings"] > 0).sum()
+        print(f"  有持仓天数: {has_trades} / {len(eq)}")
+
+    print("\n[6/6] 保存结果...")
+    eq_out = base_dir / "data" / "backtests" / "backtest_strategy_v3_equity.csv"
+    eq_out.parent.mkdir(parents=True, exist_ok=True)
+    eq.to_csv(eq_out, index=False, encoding="utf-8-sig")
+
+    # 保存交易记录
+    if trades:
+        trades_out = base_dir / "data" / "backtests" / "backtest_strategy_v3_trades.csv"
+        pd.DataFrame(trades).to_csv(trades_out, index=False, encoding="utf-8-sig")
+        print(f"  ✓ 交易记录: {trades_out} ({len(trades)}条)")
+
+    stats_out = base_dir / "data" / "backtests" / "backtest_strategy_v3_stats.json"
+    stats_out.write_text(json.dumps(m, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    print(f"\n{'=' * 60}")
+    print(f"✅ 回测完成!")
+    print(f"  📂 {eq_out}")
+    print(f"  📅 {start_date} → {eq['date'].max() if not eq.empty else 'N/A'}")
+    print(f"  📈 年化 {m['annual_return_pct']:+.2f}% | 回撤 {m['max_drawdown_pct']:.2f}% | 夏普 {m['sharpe']:.2f}")
+    print(f"{'=' * 60}")
+
+
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Deep optimization for strategy v3")
+    ap = argparse.ArgumentParser(description="Strategy V3 backtest")
     ap.add_argument("--base-dir", default=".", help="project root")
-    ap.add_argument("--start-date", default="2023-01-01", help="backtest start date")
-    ap.add_argument("--optimize", action="store_true", help="run full optimization pipeline")
+    ap.add_argument("--start-date", default=None, help="backtest start date (default: from config)")
+    ap.add_argument("--entry-mode", default=None, choices=["custom", "strict", "normal", "loose"],
+                     help="override entry mode")
+    ap.add_argument("--optimize", action="store_true", help="run full grid-search optimization")
+    ap.add_argument("--watchlist", default=None,
+                     help="指定回测股票池文件 (如 backtest_watchlist.yaml)，不指定则用全部股票")
     args = ap.parse_args()
 
     base_dir = Path(args.base_dir).resolve()
 
-    if not args.optimize:
-        print("Use --optimize to run deep optimization pipeline.")
-        return
+    # 确定起始日期：命令行 > 配置文件 > 默认值
+    if args.start_date:
+        start_date = args.start_date
+    else:
+        for name in ["config_v31.yaml", "config_optimized.yaml", "config.yaml"]:
+            p = base_dir / name
+            if p.exists():
+                with open(p, "r", encoding="utf-8") as f:
+                    raw = yaml.safe_load(f) or {}
+                sd = raw.get("backtest", {}).get("start_date") or raw.get("market_data", {}).get("start_date")
+                if sd:
+                    start_date = str(sd)
+                    break
+        else:
+            start_date = "2020-01-01"
 
-    result = run_optimization_pipeline(base_dir, start_date=args.start_date)
-
-    best_cfg: BacktestConfigV3 = result["best_cfg"]
-    m = result["strategy_metrics"]
-
-    print("\n=== Best Parameters ===")
-    print(yaml.safe_dump(asdict(best_cfg), sort_keys=False, allow_unicode=True))
-
-    print("=== Final Metrics (Optimized Strategy) ===")
-    print(f"Annual Return: {m['annual_return_pct']:.2f}%")
-    print(f"Max Drawdown: {m['max_drawdown_pct']:.2f}%")
-    print(f"Sharpe: {m['sharpe']:.2f}")
-    print(f"Win Rate: {m['win_rate_pct']:.2f}%")
-
-    print("\n=== Output Files ===")
-    for k, v in result["files"].items():
-        print(f"{k}: {v}")
+    if args.optimize:
+        result = run_optimization_pipeline(base_dir, start_date=start_date)
+        best_cfg: BacktestConfigV3 = result["best_cfg"]
+        m = result["strategy_metrics"]
+        print("\n=== Best Parameters ===")
+        print(yaml.safe_dump(asdict(best_cfg), sort_keys=False, allow_unicode=True))
+        print("=== Final Metrics (Optimized Strategy) ===")
+        print(f"Annual Return: {m['annual_return_pct']:.2f}%")
+        print(f"Max Drawdown: {m['max_drawdown_pct']:.2f}%")
+        print(f"Sharpe: {m['sharpe']:.2f}")
+        print(f"Win Rate: {m['win_rate_pct']:.2f}%")
+        print("\n=== Output Files ===")
+        for k, v in result["files"].items():
+            print(f"{k}: {v}")
+    else:
+        # 默认自动检测精选回测股票池
+        wl_file = args.watchlist
+        if wl_file is None:
+            auto_wl = base_dir / "backtest_watchlist.yaml"
+            if auto_wl.exists():
+                wl_file = "backtest_watchlist.yaml"
+                print(f"  📋 自动检测到精选回测股票池: {wl_file}")
+        run_quick_backtest(base_dir, start_date=start_date, watchlist_file=wl_file)
 
 
 if __name__ == "__main__":

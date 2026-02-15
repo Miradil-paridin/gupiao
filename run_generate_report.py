@@ -12,6 +12,12 @@ import pandas as pd
 import numpy as np
 import json, datetime, sys
 
+try:
+    from report_advanced_metrics import calc_advanced_metrics, calc_advanced_trade_stats, build_advanced_panels_html
+    HAS_ADV = True
+except ImportError:
+    HAS_ADV = False
+
 # ── 配置 ──────────────────────────────────────────────────
 
 def load_project_config(base_dir: Path) -> dict:
@@ -175,8 +181,17 @@ def calc_trade_stats(tl):
     if pnl.empty: return {"total":n}
     if pnl.abs().max()<5: pnl=pnl*100
     w=(pnl>0).sum()
-    return dict(total=n,wins=int(w),win_rate=round(w/n*100,1),
-        avg_pnl=round(pnl.mean(),2),best=round(pnl.max(),2),worst=round(pnl.min(),2))
+    # 涉及股票数
+    n_symbols = int(tl["symbol"].nunique()) if "symbol" in tl.columns else 0
+    # 平均持仓天数
+    avg_hold = round(float(tl["hold_days"].mean()), 1) if "hold_days" in tl.columns else 0
+    # 盈亏比
+    avg_win = pnl[pnl>0].mean() if (pnl>0).any() else 0
+    avg_loss = abs(pnl[pnl<0].mean()) if (pnl<0).any() else 1e-9
+    pl_ratio = round(avg_win / avg_loss, 2) if avg_loss > 0 else 0
+    return dict(total=n, wins=int(w), win_rate=round(w/n*100,1),
+        avg_pnl=round(pnl.mean(),2), best=round(pnl.max(),2), worst=round(pnl.min(),2),
+        n_symbols=n_symbols, avg_hold=avg_hold, pl_ratio=pl_ratio)
 
 # ── HTML 模板 ─────────────────────────────────────────────
 
@@ -276,7 +291,7 @@ new Chart(document.getElementById('cYearly'),{type:'bar',
 
 def build_html(version, start_date, end_date, m, dates, equity, bench_nav,
                dd_list, bench_dd_list, excess_list, yearly_strat, yearly_bench,
-               monthly, trade_stats, signal_df, config):
+               monthly, trade_stats, signal_df, config, adv_panels=""):
 
     now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
     yr_labels = [d["year"] for d in yearly_strat]
@@ -301,10 +316,14 @@ def build_html(version, start_date, end_date, m, dates, equity, bench_nav,
         ts = trade_stats
         th = f'''<div class="card"><div class="card-t"><i class="dot" style="background:var(--amber)"></i>交易统计</div>
         <div class="kpi-strip four">
-        <div class="kpi"><div class="kpi-v neu">{ts["total"]}</div><div class="kpi-l">总交易</div></div>
-        <div class="kpi"><div class="kpi-v {"pos" if ts.get("win_rate",0)>50 else "neg"}">{ts.get("win_rate","—")}%</div><div class="kpi-l">胜率</div></div>
+        <div class="kpi"><div class="kpi-v neu">{ts["total"]}</div><div class="kpi-l">总交易次数</div></div>
+        <div class="kpi"><div class="kpi-v neu">{ts.get("n_symbols",0)}</div><div class="kpi-l">涉及股票数</div></div>
+        <div class="kpi"><div class="kpi-v {"pos" if ts.get("win_rate",0)>50 else "neg"}">{ts.get("win_rate","—")}%</div><div class="kpi-l">交易胜率</div></div>
+        <div class="kpi"><div class="kpi-v {"pos" if ts.get("avg_pnl",0)>0 else "neg"}">{ts.get("avg_pnl",0):+.2f}%</div><div class="kpi-l">平均盈亏</div></div>
         <div class="kpi"><div class="kpi-v pos">{ts.get("best","—"):+.2f}%</div><div class="kpi-l">最佳单笔</div></div>
         <div class="kpi"><div class="kpi-v neg">{ts.get("worst","—"):+.2f}%</div><div class="kpi-l">最差单笔</div></div>
+        <div class="kpi"><div class="kpi-v neu">{ts.get("pl_ratio","—")}</div><div class="kpi-l">盈亏比</div></div>
+        <div class="kpi"><div class="kpi-v neu">{ts.get("avg_hold",0)}天</div><div class="kpi-l">平均持仓</div></div>
         </div></div>'''
 
     # Config summary
@@ -378,7 +397,7 @@ window._MO={json.dumps(monthly)};"""
 <div class="card"><div class="card-t"><i class="dot" style="background:var(--purple)"></i>年度收益对比</div><canvas id="cYearly" height="280"></canvas></div>
 <div class="card"><div class="card-t"><i class="dot" style="background:var(--cyan)"></i>月度收益热力图 (%)</div><div id="heatmap" class="hm"></div></div>
 
-{th}{sig_sec}
+{th}{adv_panels}{sig_sec}
 
 <div class="disc">⚠️ <strong>风险提示：</strong>本报告基于历史数据回测，不保证未来收益。股市有风险，投资需谨慎。仅供学习研究参考，不构成投资建议。</div>
 </div>
@@ -424,6 +443,18 @@ def main():
     ts = calc_trade_stats(tl)
     sig = load_latest_signal(base_dir)
 
+    # 高级指标
+    adv_panels = ""
+    if HAS_ADV:
+        print("\n[4.5] 计算高级指标...")
+        adv = calc_advanced_metrics(df)
+        ts_adv = calc_advanced_trade_stats(tl)
+        adv_panels = build_advanced_panels_html(m, adv, ts_adv)
+        print(f"  Alpha: {adv['alpha']:+.1f}% | Beta: {adv['beta']:.2f} | IR: {adv['information_ratio']:.2f} | VaR: {adv['var_95']:.2f}%")
+        print(f"  Halflife: {ts_adv.get('halflife','-')}天 | 容量: {adv['capacity_low']}-{adv['capacity_high']}万")
+    else:
+        print("\n  ⚠️ report_advanced_metrics.py 未找到，跳过高级指标")
+
     print("\n[5] 生成HTML...")
     pk=df["equity"].cummax(); bpk=df["benchmark_nav"].cummax()
     html = build_html(
@@ -434,7 +465,7 @@ def main():
         ((df["equity"]/pk-1)*100).round(2).tolist(),
         ((df["benchmark_nav"]/bpk-1)*100).round(2).tolist(),
         ((df["equity"]/df["benchmark_nav"]-1)*100).round(2).tolist(),
-        ys, yb, mo, ts, sig, config)
+        ys, yb, mo, ts, sig, config, adv_panels=adv_panels)
 
     out = base_dir / "out"; out.mkdir(exist_ok=True)
     op = out / "backtest_report.html"

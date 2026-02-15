@@ -1,57 +1,90 @@
 """
-信号计算模块 (升级版)
+信号计算模块 (V3.1 统一版)
 
-原有功能：
+功能：
 - 因子得分计算 (score)
 - 横截面排名 (rank)
 - 动作标签 (INVEST_MORE, HOLD, REDUCE, WITHDRAW, LEAST)
-
-新增功能：
-- 市场环境过滤 (可选)
-- 可交易性过滤 (一字板、涨停)
-- 涨停回调入场 (eligible)
-- 波动反比仓位分配 (target_weight)
+- 可交易性过滤 + 流动性过滤
+- 严格/普通/宽松 入场模式
+- 行业分散控制
+- TDX 指标加分与保护
+- 波动反比仓位分配
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict
+import re
+
 import numpy as np
 import pandas as pd
 
 
 @dataclass
 class SignalConfig:
-    """信号配置（兼容原版 + 新增参数）"""
+    """信号配置 V3.1"""
+    # 选股
+    invest_more_n: int = 15
+    least_n: int = 3
+    withdraw_score_threshold: float = -0.5
+    risk_vol_20d_threshold: float = 0.55
 
-    # === 原有参数 ===
-    invest_more_n: int = 3  # 每日选股数
-    least_n: int = 2  # 最差股票数
-    withdraw_score_threshold: float = -0.5  # 撤退分数阈值
-    risk_vol_20d_threshold: float = 0.55  # 高波动阈值
+    # 入场过滤
+    use_tradeability_filter: bool = True
+    use_limit_up_entry: bool = True
+    pullback_window_start: int = 3
+    pullback_window_end: int = 10
+    pullback_min_pct: float = 0.10
+    pullback_max_pct: float = 0.30
+    use_dynamic_pullback: bool = False
+    dynamic_pullback_min_atr_mult: float = 1.5
+    dynamic_pullback_max_atr_mult: float = 4.0
 
-    # === 新增：入场过滤 ===
-    use_tradeability_filter: bool = True  # 可交易性过滤
-    use_limit_up_entry: bool = False  # 涨停回调入场（默认关闭，兼容旧版）
+    # 通达信指标
+    use_tdx_indicators: bool = True
+    tdx_high30_weight: float = 1.0
+    tdx_main_force_weight: float = 1.5
+    tdx_limit_up_30d_weight: float = 0.5
+    tdx_min_score: float = 1.5
 
-    # === 新增：涨停回调参数 ===
-    pullback_window_start: int = 3  # 回调窗口开始
-    pullback_window_end: int = 10  # 回调窗口结束
-    pullback_min_pct: float = 0.05  # 最小回调 5%
-    pullback_max_pct: float = 0.25  # 最大回调 25%
-    volume_breakout_ratio: float = 1.3  # 放量倍数
+    # 仓位管理
+    use_volatility_sizing: bool = True
+    max_single_weight: float = 0.15
 
-    # === 新增：仓位管理 ===
-    use_volatility_sizing: bool = False  # 波动反比仓位（默认关闭）
-    max_single_weight: float = 0.20  # 单只最大权重 20%
+    # 入场模式
+    entry_mode: str = "strict"  # strict/normal/loose
 
-    # === 新增：市场环境 ===
-    use_market_regime: bool = False  # 市场环境过滤（默认关闭）
+    # 市场环境
+    use_market_regime: bool = False
+
+    # 行业分散
+    use_industry_diversification: bool = True
+    max_per_industry: int = 2
+
+    # 流动性
+    use_liquidity_filter: bool = True
+    min_amount_20d: float = 6e7
+    min_turnover_20d: float = 0.6
+
+    # 风控
+    use_tdx_protection: bool = True
+    tdx_protection_threshold: float = 2.0
+
+
+def _safe_float(value, default: float = 0.0) -> float:
+    """安全地将任意值转换为 float，转换失败时返回默认值"""
+    if value is None or (isinstance(value, float) and np.isnan(value)):
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def _zscore(x: pd.Series) -> pd.Series:
-    """计算横截面 z-score"""
+    """Z-score 标准化"""
     x = x.astype(float)
     mu = x.mean()
     sd = x.std(ddof=1)
@@ -70,116 +103,219 @@ def load_features(base_dir: Path) -> pd.DataFrame:
     return df
 
 
-# =============================================================================
-# 新增：可交易性过滤
-# =============================================================================
+def build_industry_map(config_path: Path) -> Dict[str, str]:
+    """从 config.yaml 构建行业映射"""
+    mapping: Dict[str, str] = {}
+
+    if not config_path.exists():
+        return mapping
+
+    content = config_path.read_text(encoding="utf-8", errors="ignore")
+    current_industry = "其他"
+
+    for line in content.split("\n"):
+        if "==========" in line:
+            match = re.search(r"=+\s*([^=]+)\s*=+", line)
+            if match:
+                current_industry = match.group(1).strip()
+                if "消费" in current_industry:
+                    current_industry = "消费"
+                elif "医药" in current_industry:
+                    current_industry = "医药"
+                elif "科技" in current_industry:
+                    current_industry = "科技"
+                elif "金融" in current_industry:
+                    current_industry = "金融"
+                elif "能源" in current_industry or "新能源" in current_industry:
+                    current_industry = "新能源"
+                else:
+                    current_industry = "其他"
+
+        code_match = re.search(r'"(\d{6})"', line)
+        if code_match:
+            code = code_match.group(1)
+            mapping[code] = current_industry
+            if code.startswith(("6", "5")):
+                mapping[f"{code}.SH"] = current_industry
+            else:
+                mapping[f"{code}.SZ"] = current_industry
+
+    return mapping
+
 
 def filter_tradeability(day: pd.DataFrame, cfg: SignalConfig) -> pd.DataFrame:
-    """
-    可交易性过滤
-
-    过滤规则：
-    1. 一字板：high == low（买不进）
-    2. 当日涨停：不追涨停
-    3. 异常数据：close <= 0
-    """
+    """可交易性过滤"""
     day = day.copy()
     day["tradeable"] = True
 
-    # 异常数据
     if "close" in day.columns:
         day.loc[day["close"] <= 0, "tradeable"] = False
 
-    # 一字板
     if "one_line_board" in day.columns:
         day.loc[day["one_line_board"] == 1, "tradeable"] = False
     elif "high" in day.columns and "low" in day.columns:
         day.loc[day["high"] == day["low"], "tradeable"] = False
 
-    # 当日涨停（不追）
     if "limit_up_flag" in day.columns:
         day.loc[day["limit_up_flag"] == 1, "tradeable"] = False
 
-    # 当日接近涨停（不追）
     if "near_limit_up" in day.columns:
         day.loc[day["near_limit_up"] == 1, "tradeable"] = False
 
     return day
 
 
-# =============================================================================
-# 新增：涨停回调入场资格
-# =============================================================================
+def check_liquidity(row: pd.Series, cfg: SignalConfig) -> bool:
+    """检查流动性"""
+    if not cfg.use_liquidity_filter:
+        return True
 
-def compute_eligible(day: pd.DataFrame, cfg: SignalConfig) -> pd.DataFrame:
-    """
-    计算入场资格
+    amount_20d = _safe_float(row.get("amount_20d", row.get("amount", 0)))
+    min_amount = _safe_float(cfg.min_amount_20d, 6e7)
+    if amount_20d < min_amount:
+        return False
 
-    涨停回调入场条件：
-    1. 近期有涨停（3-10天内）
-    2. 回调幅度在 5%-25%
-    3. 放量突破
-    4. 近期低点不创新低
-    """
-    day = day.copy()
-    day["eligible"] = False
+    turnover_20d = _safe_float(row.get("turnover_20d", row.get("turnover", 0)))
+    min_turnover = _safe_float(cfg.min_turnover_20d, 0.6)
+    if turnover_20d < min_turnover:
+        return False
 
-    # 检查必需列
-    required = ["days_since_limit_up", "pullback_pct", "volume_breakout", "price_above_ma5"]
-    missing = [c for c in required if c not in day.columns]
+    return True
 
-    if missing:
-        # 缺少涨停特征，使用简化版（趋势向上即可）
-        if "ma_dist_20" in day.columns:
-            day["eligible"] = day["ma_dist_20"] > 0
-        else:
-            day["eligible"] = True
-        return day
 
-    # 条件1：在回调窗口内
-    in_window = (
-            (day["days_since_limit_up"] >= cfg.pullback_window_start) &
-            (day["days_since_limit_up"] <= cfg.pullback_window_end)
+def _get_pullback_bounds(row: pd.Series, cfg: SignalConfig) -> tuple[float, float]:
+    """获取动态回调范围（可选根据 ATR 调整）。"""
+    min_pct = cfg.pullback_min_pct
+    max_pct = cfg.pullback_max_pct
+
+    if not cfg.use_dynamic_pullback:
+        return min_pct, max_pct
+
+    atr_pct = _safe_float(row.get("atr_pct", 0))
+    if atr_pct <= 0:
+        return min_pct, max_pct
+
+    dyn_min = atr_pct * cfg.dynamic_pullback_min_atr_mult
+    dyn_max = atr_pct * cfg.dynamic_pullback_max_atr_mult
+    min_pct = max(min_pct, dyn_min)
+    max_pct = max(max_pct, dyn_max)
+    if max_pct < min_pct:
+        max_pct = min_pct
+    return min_pct, max_pct
+
+
+def check_eligible_strict(row: pd.Series, cfg: SignalConfig) -> bool:
+    """严格入场条件检查"""
+    trend_up = _safe_float(row.get("ma_dist_20", 0)) > 0
+    if not trend_up:
+        return False
+
+    limit_up_entry = False
+    if cfg.use_limit_up_entry:
+        days_since = row.get("days_since_limit_up", np.nan)
+        pullback = row.get("pullback_pct", np.nan)
+        volume_breakout = row.get("volume_breakout", 0)
+        price_above_ma5 = row.get("price_above_ma5", 0)
+
+        if not pd.isna(days_since) and not pd.isna(pullback):
+            days_since = _safe_float(days_since)
+            pullback = _safe_float(pullback)
+            in_window = cfg.pullback_window_start <= days_since <= cfg.pullback_window_end
+            pb_min, pb_max = _get_pullback_bounds(row, cfg)
+            pullback_ok = pb_min <= pullback <= pb_max
+            breakout_ok = volume_breakout == 1 and price_above_ma5 == 1
+
+            if in_window and pullback_ok and breakout_ok:
+                limit_up_entry = True
+
+    tdx_entry = False
+    if cfg.use_tdx_indicators:
+        tdx_score = _safe_float(row.get("tdx_score", 0))
+        if tdx_score >= cfg.tdx_min_score:
+            tdx_entry = True
+
+        high30 = row.get("high30_breakout", 0)
+        main_force = row.get("main_force_strong", 0)
+        if high30 == 1 and main_force == 1:
+            tdx_entry = True
+
+    return (limit_up_entry or tdx_entry) and trend_up
+
+
+def check_eligible_normal(row: pd.Series, cfg: SignalConfig) -> bool:
+    """普通入场条件检查"""
+    if cfg.use_limit_up_entry:
+        days_since = row.get("days_since_limit_up", np.nan)
+        pullback = row.get("pullback_pct", np.nan)
+        volume_breakout = row.get("volume_breakout", 0)
+        price_above_ma5 = row.get("price_above_ma5", 0)
+
+        if not pd.isna(days_since) and not pd.isna(pullback):
+            days_since = _safe_float(days_since)
+            pullback = _safe_float(pullback)
+            in_window = cfg.pullback_window_start <= days_since <= cfg.pullback_window_end
+            pb_min, pb_max = _get_pullback_bounds(row, cfg)
+            pullback_ok = pb_min <= pullback <= pb_max
+            breakout_ok = volume_breakout == 1 and price_above_ma5 == 1
+
+            if in_window and pullback_ok and breakout_ok:
+                return True
+
+    if cfg.use_tdx_indicators:
+        tdx_score = _safe_float(row.get("tdx_score", 0))
+        if tdx_score >= cfg.tdx_min_score:
+            return True
+
+        high30 = row.get("high30_breakout", 0)
+        main_force = row.get("main_force_strong", 0)
+        if high30 == 1 and main_force == 1:
+            return True
+
+    ma_dist = _safe_float(row.get("ma_dist_20", 0))
+    ret_20d = _safe_float(row.get("ret_20d", 0))
+
+    return ma_dist > 0.02 and ret_20d > 0
+
+
+def check_eligible(row: pd.Series, cfg: SignalConfig) -> bool:
+    """根据模式检查入场条件"""
+    if cfg.entry_mode == "strict":
+        return check_eligible_strict(row, cfg)
+    if cfg.entry_mode == "loose":
+        return _safe_float(row.get("ma_dist_20", 0)) > 0
+    return check_eligible_normal(row, cfg)
+
+
+def apply_industry_diversification(
+    candidates: pd.DataFrame,
+    industry_map: Dict[str, str],
+    max_per_industry: int,
+) -> pd.DataFrame:
+    """应用行业分散控制"""
+    if candidates.empty:
+        return candidates
+
+    candidates = candidates.copy()
+    candidates["industry"] = candidates["symbol"].astype(str).map(
+        lambda s: industry_map.get(s, industry_map.get(s.split(".")[0], "其他"))
     )
 
-    # 条件2：回调幅度合理
-    pullback_ok = (
-            (day["pullback_pct"] >= cfg.pullback_min_pct) &
-            (day["pullback_pct"] <= cfg.pullback_max_pct)
-    )
+    result = []
+    industry_counts: Dict[str, int] = {}
 
-    # 条件3：放量突破 + 价格在MA5上方
-    breakout_ok = (
-            (day["volume_breakout"] == 1) &
-            (day["price_above_ma5"] == 1)
-    )
+    for _, row in candidates.iterrows():
+        ind = row["industry"]
+        count = industry_counts.get(ind, 0)
 
-    # 条件4：不创新低
-    if "no_new_low" in day.columns:
-        no_new_low = day["no_new_low"] == 1
-    else:
-        no_new_low = pd.Series(True, index=day.index)
+        if count < max_per_industry:
+            result.append(row)
+            industry_counts[ind] = count + 1
 
-    # 综合条件
-    eligible_mask = in_window & pullback_ok & breakout_ok & no_new_low
-    day.loc[eligible_mask, "eligible"] = True
+    return pd.DataFrame(result)
 
-    return day
-
-
-# =============================================================================
-# 新增：仓位分配
-# =============================================================================
 
 def compute_weights(selected: pd.DataFrame, cfg: SignalConfig) -> Dict[str, float]:
-    """
-    计算目标仓位权重
-
-    规则：
-    1. 如果启用波动反比：权重 = 1/atr_pct
-    2. 否则等权
-    3. 限制单只最大权重
-    """
+    """计算目标仓位权重"""
     if selected.empty:
         return {}
 
@@ -187,48 +323,32 @@ def compute_weights(selected: pd.DataFrame, cfg: SignalConfig) -> Dict[str, floa
     n = len(selected)
 
     if cfg.use_volatility_sizing and "atr_pct" in selected.columns:
-        # 波动反比
         atr = selected["atr_pct"].clip(lower=0.01)
         raw_w = 1.0 / atr
         raw_w = raw_w / raw_w.sum()
     else:
-        # 等权
         raw_w = pd.Series(1.0 / n, index=selected.index)
 
-    # 限制单只最大权重
     weights = raw_w.clip(upper=cfg.max_single_weight)
-
-    # 归一化（如果有截断）
     if weights.sum() > 1.0:
         weights = weights / weights.sum()
 
     return dict(zip(selected["symbol"], weights))
 
 
-# =============================================================================
-# 主函数：计算每日排名（兼容原版 API）
-# =============================================================================
-
 def compute_daily_ranking(
-        feats: pd.DataFrame,
-        as_of: str | None = None,
-        cfg: SignalConfig | None = None,
-        market_can_open: bool = True,  # 新增：市场是否允许开仓
+    feats: pd.DataFrame,
+    as_of: str | None = None,
+    cfg: SignalConfig | None = None,
+    industry_map: Dict[str, str] | None = None,
+    market_can_open: bool = True,
 ) -> pd.DataFrame:
-    """
-    计算单日横截面排名 + 动作标签
-
-    Args:
-        feats: 特征数据
-        as_of: 日期 "YYYY-MM-DD"，None 则取最新
-        cfg: 配置
-        market_can_open: 市场是否允许开仓（新增）
-
-    Returns:
-        DataFrame with: date, symbol, score, rank, action, target_weight, ...
-    """
+    """计算单日排名信号（V3.1 统一版）"""
     if cfg is None:
         cfg = SignalConfig()
+
+    if industry_map is None:
+        industry_map = {}
 
     if as_of is None:
         d = feats["date"].max()
@@ -240,178 +360,142 @@ def compute_daily_ranking(
     if day.empty:
         raise ValueError(f"No rows for date: {d}")
 
-    # =====================
-    # 必需列检查
-    # =====================
-    need = [
-        "symbol", "date", "close",
-        "ma_dist_20", "ret_20d", "ret_60d",
-        "vol_20d", "atr_14", "vol_ratio_20",
-        "ma_20"
+    numeric_cols = [
+        "ma_dist_20", "ret_20d", "ret_60d", "vol_20d", "vol_ratio_20",
+        "atr_14", "close", "amount_20d", "amount", "turnover_20d", "turnover",
+        "tdx_score", "days_since_limit_up", "pullback_pct",
     ]
-    miss = [c for c in need if c not in day.columns]
-    if miss:
-        raise ValueError(f"Missing feature columns: {miss}")
+    for col in numeric_cols:
+        if col in day.columns:
+            day[col] = pd.to_numeric(day[col], errors="coerce")
 
-    # =====================
-    # Step 1: 可交易性过滤（新增）
-    # =====================
+    if "atr_14" in day.columns and "close" in day.columns:
+        day["atr_pct"] = day["atr_14"] / day["close"]
+    else:
+        day["atr_pct"] = 0.02
+
+    z_ma = _zscore(day["ma_dist_20"]) if "ma_dist_20" in day.columns else 0
+    z_r20 = _zscore(day["ret_20d"]) if "ret_20d" in day.columns else 0
+    z_r60 = _zscore(day["ret_60d"]) if "ret_60d" in day.columns else 0
+    z_vol = _zscore(day["vol_20d"]) if "vol_20d" in day.columns else 0
+    z_atr = _zscore(day["atr_pct"])
+    z_vr = _zscore(day["vol_ratio_20"]) if "vol_ratio_20" in day.columns else 0
+
+    day["score"] = (
+        2.0 * z_ma +
+        1.0 * z_r20 +
+        0.5 * z_r60 -
+        1.0 * z_vol -
+        0.5 * z_atr +
+        0.3 * z_vr
+    )
+
+    if cfg.use_tdx_indicators:
+        if "high30_breakout" in day.columns:
+            day["score"] += day["high30_breakout"].fillna(0) * cfg.tdx_high30_weight
+        if "main_force_strong" in day.columns:
+            day["score"] += day["main_force_strong"].fillna(0) * cfg.tdx_main_force_weight
+        if "has_limit_up_30d" in day.columns:
+            day["score"] += day["has_limit_up_30d"].fillna(0) * cfg.tdx_limit_up_30d_weight
+        if "main_force_control" in day.columns:
+            day["score"] += (day["main_force_control"].fillna(0) > 0).astype(int) * 0.3
+
+    day["trend_up"] = (day.get("ma_dist_20", pd.Series(0, index=day.index)) > 0).astype(int)
+    day["mom_bad"] = (
+        (day.get("ret_20d", pd.Series(0, index=day.index)) < 0) &
+        (day.get("ret_60d", pd.Series(0, index=day.index)) < 0)
+    ).astype(int)
+    day["risk_high"] = (day.get("vol_20d", pd.Series(0, index=day.index)) >= cfg.risk_vol_20d_threshold).astype(int)
+
     if cfg.use_tradeability_filter:
         day = filter_tradeability(day, cfg)
-        # 只对可交易的股票计算信号
-        tradeable_day = day[day.get("tradeable", True) == True].copy()
     else:
-        tradeable_day = day.copy()
         day["tradeable"] = True
 
-    if tradeable_day.empty:
-        # 全部不可交易，返回空结果
-        day["score"] = 0
-        day["rank"] = np.nan
-        day["action"] = "WITHDRAW"
-        day["target_weight"] = 0.0
-        return day
+    day["liquidity_ok"] = day.apply(lambda r: check_liquidity(r, cfg), axis=1)
+    day["eligible"] = day.apply(lambda r: check_eligible(r, cfg), axis=1)
 
-    # =====================
-    # Step 2: 计算因子得分
-    # =====================
-    tradeable_day["atr_pct"] = tradeable_day["atr_14"] / tradeable_day["close"]
+    day = day.sort_values("score", ascending=False).reset_index(drop=True)
+    day["rank"] = np.arange(1, len(day) + 1)
 
-    z_ma = _zscore(tradeable_day["ma_dist_20"])
-    z_r20 = _zscore(tradeable_day["ret_20d"])
-    z_r60 = _zscore(tradeable_day["ret_60d"])
-    z_vol = _zscore(tradeable_day["vol_20d"])
-    z_atr = _zscore(tradeable_day["atr_pct"])
-    z_vr = _zscore(tradeable_day["vol_ratio_20"])
+    day["action"] = "HOLD"
 
-    tradeable_day["score"] = (
-            2.0 * z_ma +
-            1.0 * z_r20 +
-            0.5 * z_r60 -
-            1.0 * z_vol -
-            0.5 * z_atr +
-            0.3 * z_vr
-    )
-
-    # =====================
-    # Step 3: 趋势/动量标记
-    # =====================
-    tradeable_day["trend_up"] = (tradeable_day["ma_dist_20"] > 0).astype(int)
-    tradeable_day["mom_bad"] = (
-            (tradeable_day["ret_20d"] < 0) & (tradeable_day["ret_60d"] < 0)
-    ).astype(int)
-    tradeable_day["risk_high"] = (tradeable_day["vol_20d"] >= cfg.risk_vol_20d_threshold).astype(int)
-
-    # =====================
-    # Step 4: 入场资格（新增）
-    # =====================
-    if cfg.use_limit_up_entry:
-        tradeable_day = compute_eligible(tradeable_day, cfg)
+    if cfg.use_tdx_protection:
+        tdx_score = day.get("tdx_score", pd.Series(0, index=day.index))
+        withdraw_mask = (
+            ((day["trend_up"] == 0) & (day["mom_bad"] == 1) & (tdx_score < cfg.tdx_protection_threshold)) |
+            (day["score"] <= cfg.withdraw_score_threshold)
+        )
     else:
-        # 不使用涨停回调，趋势向上即有资格
-        tradeable_day["eligible"] = tradeable_day["trend_up"] == 1
+        withdraw_mask = (
+            ((day["trend_up"] == 0) & (day["mom_bad"] == 1)) |
+            (day["score"] <= cfg.withdraw_score_threshold)
+        )
+    day.loc[withdraw_mask, "action"] = "WITHDRAW"
 
-    # =====================
-    # Step 5: 排名
-    # =====================
-    tradeable_day = tradeable_day.sort_values("score", ascending=False).reset_index(drop=True)
-    tradeable_day["rank"] = np.arange(1, len(tradeable_day) + 1)
-
-    # =====================
-    # Step 6: 动作标签
-    # =====================
-    tradeable_day["action"] = "HOLD"
-
-    # WITHDRAW: 趋势向下 + 动量差，或分数太低
-    withdraw_mask = (
-            ((tradeable_day["trend_up"] == 0) & (tradeable_day["mom_bad"] == 1)) |
-            (tradeable_day["score"] <= cfg.withdraw_score_threshold)
-    )
-    tradeable_day.loc[withdraw_mask, "action"] = "WITHDRAW"
-
-    # REDUCE: 高波动但趋势向上
     reduce_mask = (
-            (tradeable_day["action"] != "WITHDRAW") &
-            (tradeable_day["risk_high"] == 1) &
-            (tradeable_day["trend_up"] == 1) &
-            (tradeable_day["mom_bad"] == 0)
+        (day["action"] != "WITHDRAW") &
+        (day["risk_high"] == 1) &
+        (day["trend_up"] == 1) &
+        (day["mom_bad"] == 0)
     )
-    tradeable_day.loc[reduce_mask, "action"] = "REDUCE"
+    day.loc[reduce_mask, "action"] = "REDUCE"
 
-    # INVEST_MORE: 从有资格的候选中选 TopN
+    invest_candidates = day[
+        (day["action"] == "HOLD") &
+        (day["tradeable"] == True) &
+        (day["liquidity_ok"] == True) &
+        (day["eligible"] == True) &
+        (day["trend_up"] == 1)
+    ].copy()
+
+    if cfg.use_industry_diversification and industry_map:
+        invest_candidates = apply_industry_diversification(
+            invest_candidates.sort_values("score", ascending=False),
+            industry_map,
+            cfg.max_per_industry,
+        )
+
     if cfg.use_market_regime and not market_can_open:
-        # 市场不允许开仓
         invest_syms = []
     else:
-        invest_candidates = tradeable_day[
-            (tradeable_day["action"] == "HOLD") &
-            (tradeable_day["eligible"] == True)
-            ].copy()
         invest_syms = invest_candidates.sort_values("score", ascending=False).head(cfg.invest_more_n)["symbol"].tolist()
+    day.loc[day["symbol"].isin(invest_syms), "action"] = "INVEST_MORE"
 
-    tradeable_day.loc[tradeable_day["symbol"].isin(invest_syms), "action"] = "INVEST_MORE"
-
-    # LEAST: 最差的几只
-    least_candidates = tradeable_day[tradeable_day["action"] == "HOLD"].sort_values("score", ascending=True)
+    least_candidates = day[day["action"] == "HOLD"].sort_values("score", ascending=True)
     least_syms = least_candidates.head(cfg.least_n)["symbol"].tolist()
-    tradeable_day.loc[tradeable_day["symbol"].isin(least_syms), "action"] = "LEAST"
+    day.loc[day["symbol"].isin(least_syms), "action"] = "LEAST"
 
-    # =====================
-    # Step 7: 目标权重（新增）
-    # =====================
-    selected = tradeable_day[tradeable_day["action"] == "INVEST_MORE"]
+    selected = day[day["action"] == "INVEST_MORE"]
     weights = compute_weights(selected, cfg)
+    day["target_weight"] = day["symbol"].map(weights).fillna(0.0)
 
-    tradeable_day["target_weight"] = tradeable_day["symbol"].map(weights).fillna(0.0)
-
-    # =====================
-    # Step 8: 合并回原数据
-    # =====================
-    # 把计算结果合并回完整的 day（包括不可交易的）
-    merge_cols = ["symbol", "score", "rank", "action", "atr_pct", "trend_up", "mom_bad",
-                  "risk_high", "eligible", "target_weight"]
-    merge_cols = [c for c in merge_cols if c in tradeable_day.columns]
-
-    day = day.merge(
-        tradeable_day[["symbol"] + [c for c in merge_cols if c != "symbol"]],
-        on="symbol",
-        how="left",
-        suffixes=("", "_new")
+    day["industry"] = day["symbol"].astype(str).map(
+        lambda s: industry_map.get(s, industry_map.get(s.split(".")[0], "其他"))
     )
 
-    # 处理未计算的行（不可交易）
-    day["action"] = day["action"].fillna("WITHDRAW")
-    day["target_weight"] = day["target_weight"].fillna(0.0)
-    day["score"] = day["score"].fillna(0.0)
-
-    # =====================
-    # 输出
-    # =====================
     out_cols = [
-        "date", "symbol",
-        "close",
-        "score", "rank", "action",
-        "target_weight",
+        "date", "symbol", "industry", "close",
+        "score", "rank", "action", "target_weight",
         "ma_dist_20", "ret_20d", "ret_60d",
         "vol_20d", "atr_pct", "vol_ratio_20",
         "trend_up", "mom_bad", "risk_high",
+        "tradeable", "liquidity_ok", "eligible",
     ]
 
-    # 新增列（如果存在）
-    extra_cols = ["tradeable", "eligible", "limit_up_flag", "pullback_pct"]
-    for c in extra_cols:
+    tdx_cols = [
+        "high30_breakout", "main_force_strong", "main_force_control",
+        "has_limit_up_30d", "tdx_score",
+    ]
+    for c in tdx_cols:
         if c in day.columns:
             out_cols.append(c)
 
     out_cols = [c for c in out_cols if c in day.columns]
-    day = day[out_cols].sort_values("rank", na_position="last").reset_index(drop=True)
+    day = day[out_cols].sort_values("rank").reset_index(drop=True)
 
     return day
 
-
-# =============================================================================
-# 保存函数（保持不变）
-# =============================================================================
 
 def save_daily_ranking(base_dir: Path, ranking: pd.DataFrame) -> tuple[Path, Path]:
     out_dir = base_dir / "data" / "signals"
@@ -426,8 +510,6 @@ def save_daily_ranking(base_dir: Path, ranking: pd.DataFrame) -> tuple[Path, Pat
 
 def export_qlib_signal_csv(base_dir: Path, ranking: pd.DataFrame) -> Path:
     """导出 Qlib 格式信号"""
-    from pandas.errors import EmptyDataError
-
     out_path = base_dir / "out" / "signal.csv"
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -467,31 +549,19 @@ def export_qlib_signal_csv(base_dir: Path, ranking: pd.DataFrame) -> Path:
     return out_path
 
 
-# =============================================================================
-# 测试
-# =============================================================================
-
 if __name__ == "__main__":
-    from pathlib import Path
-
     base_dir = Path(__file__).resolve().parent.parent
 
     print("加载特征...")
     feats = load_features(base_dir)
     print(f"日期范围: {feats['date'].min()} -> {feats['date'].max()}")
 
-    # 测试原版配置
-    print("\n=== 原版配置 ===")
-    cfg_v1 = SignalConfig()
-    ranking_v1 = compute_daily_ranking(feats, cfg=cfg_v1)
-    print(ranking_v1[["symbol", "action", "rank", "score"]].head(10))
+    print("\n=== V3.1 统一版配置 ===")
+    cfg = SignalConfig()
 
-    # 测试升级版配置
-    print("\n=== 升级版配置（含入场过滤）===")
-    cfg_v2 = SignalConfig(
-        use_tradeability_filter=True,
-        use_limit_up_entry=True,
-        use_volatility_sizing=True,
-    )
-    ranking_v2 = compute_daily_ranking(feats, cfg=cfg_v2)
-    print(ranking_v2[["symbol", "action", "rank", "score", "target_weight"]].head(10))
+    industry_map = build_industry_map(base_dir / "config.yaml")
+    if not industry_map:
+        industry_map = build_industry_map(base_dir / "config_v31.yaml")
+
+    ranking = compute_daily_ranking(feats, cfg=cfg, industry_map=industry_map)
+    print(ranking[["symbol", "action", "rank", "score", "target_weight"]].head(10))
