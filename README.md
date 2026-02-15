@@ -1,9 +1,22 @@
-# A股智能量化交易系统 V3.0
+# A股智能量化交易系统 V3.2
 
-> 多因子选股 · 涨停回调 · 主力控盘 · 智能风控 · AI研报
+> 两阶段动态选股 · 涨停回调 · 主力控盘 · 五重风控 · 信号分级 · AI研报
 
 ![Python](https://img.shields.io/badge/Python-3.10+-blue.svg)
 ![License](https://img.shields.io/badge/License-MIT-green.svg)
+
+---
+
+## 📈 回测业绩
+
+| 指标 | V3.1（50只） | V3.2（450只） | 变化 |
+|------|-------------|--------------|------|
+| **年化收益** | 16.44% | **26.16%** | +10% ↑ |
+| **总收益** | — | **292.52%** | — |
+| **超额收益** | — | **278.80%** | — |
+| **夏普比率** | 1.27 | **1.67** | +0.4 ↑ |
+| **交易次数** | — | 1121笔 | — |
+| 回测区间 | 2020-01 → 2026-02 | 2020-01 → 2026-02 | — |
 
 ---
 
@@ -11,12 +24,16 @@
 
 | 特性 | 说明 |
 |------|------|
-| 🎯 **精准入场** | 涨停回调 + 主力控盘（月线）双重验证 |
-| 🛡️ **多重风控** | 止损/止盈/时间止损三重保护 |
-| 📊 **科学选股** | 多因子模型 + 通达信月线指标 |
-| 🤖 **AI研报** | DeepSeek/MiMo 大模型 + 可视化图表 |
+| 🔍 **两阶段选股** | 全市场5000只 → 通达信公式筛450只 → 日线策略选20只 |
+| 🎯 **精准入场** | 涨停回调 + 主力控盘 + 2-of-3多路径验证 |
+| 📊 **信号分级** | 强/普通/弱三级信号，自动调整仓位 |
+| 🛡️ **五重风控** | 硬止损/ATR止损/失败形态/动态止盈/时间止损 |
+| 💰 **盈利加仓** | 浮盈>5%自动加仓50%，让利润奔跑 |
+| 📰 **精准新闻** | 只抓信号前30只的新闻，不全覆盖 |
+| 🤖 **AI研报** | MiMo 大模型生成研报 + 新闻摘要 + 可视化图表 |
 | ⚡ **高性能** | 并行抓取 + LRU缓存 + 增量更新 |
-| 📈 **自动化** | 一键运行，每日自动生成信号 |
+
+> **说明：** 交易决策（买卖、仓位）完全由量化策略（规则引擎+因子评分）做出，AI（MiMo）的角色是生成研报和分析新闻情绪，不参与交易决策。
 
 ---
 
@@ -25,203 +42,163 @@
 ### 1. 环境配置
 
 ```bash
-# 创建虚拟环境
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1  # Windows
-# source .venv/bin/activate   # Linux/Mac
 
-# 安装依赖
 pip install -r requirements.txt
-pip install pyarrow matplotlib  # 可选：图表支持
+pip install pyarrow matplotlib  # 可选
 ```
 
 ### 2. 配置文件
 
 **`.env` 环境变量：**
 ```bash
-# LLM 选择
-LLM_PROVIDER=deepseek  # deepseek 或 mimo
+# LLM 选择（用于AI研报和新闻摘要，不影响交易决策）
+LLM_PROVIDER=mimo
 
-# DeepSeek 配置
-DEEPSEEK_API_KEY=your_key
-DEEPSEEK_MODEL=deepseek-reasoner
+# MiMo 配置
+MIMO_API_KEY=your_key
+MIMO_MODEL=MiMo-7B-RL
 ```
 
-**`config.yaml` 策略配置：**
-```yaml
-watchlist:
-  - "600519"  # 贵州茅台
-  - "000858"  # 五粮液
-  # ... 50只精选龙头股
+**`config_v31.yaml` 策略配置：** 见下方策略说明。
 
-strategy:
-  top_k: 10                   # 每日推荐数
-  use_tdx_indicators: true    # 通达信月线指标
-  use_limit_up_pullback: true # 涨停回调入场
-
-market_data:
-  start_date: "2023-01-01"    # 数据起始日期
-```
-
-### 3. 一键运行
+### 3. 首次运行（建立股票池+数据）
 
 ```bash
-# 完整运行
-python run_all_daily.py
-
-# 快速模式（跳过新闻+图表）
-python run_all_daily.py --fast
-
-# 跳过AI研报
-python run_all_daily.py --skip-ai
+python run_update_watchlist.py        # 全市场扫描 → 450只
+python sync_watchlist.py              # 同步到配置文件
+python run_fetch_daily.py             # 抓取历史数据（首次15-30分钟）
+python run_build_market_daily_all.py  # 构建市场数据
+python run_build_features_daily.py    # 生成特征
+python run_backtest_strategy_v3.py    # 回测验证
+python run_generate_report.py         # 生成报告
 ```
+
+### 4. 每日运行
+
+```bash
+python run_all_daily.py               # 一键完成全部流程
+python run_all_daily.py --fast        # 快速模式（跳过新闻+图表）
+python run_all_daily.py --skip-ai     # 跳过AI研报
+```
+
+---
+
+## 🔄 运行流程
+
+### 🗓️ 每周一次（更新股票池，约20分钟）
+
+股票池会变化，需要定期从全市场重新筛选：
+
+```bash
+# Step 1: 全市场扫描 → 筛选出约500只
+python run_update_watchlist.py
+
+# Step 2: 同步到配置文件
+python sync_watchlist.py
+
+# Step 3: 抓取新股票的历史数据（首次约15分钟，之后增量秒过）
+python run_fetch_daily.py
+
+# Step 4: 构建市场数据
+python run_build_market_daily_all.py
+
+# Step 5: 计算特征（含通达信指标）
+python run_build_features_daily.py
+```
+
+### 📅 每天一次（生成信号+报告，约5-10分钟）
+
+```bash
+# 一键完成全部流程
+python run_all_daily.py
+```
+
+`run_all_daily.py` 内部自动执行：
+1. 增量抓取今日行情（500只，约2分钟）
+2. 构建市场数据
+3. 更新特征
+4. **生成今日信号** → `data/signals/latest_daily_rank.csv`
+5. 只抓信号前30只的新闻（不全覆盖，省时间）
+6. AI简报
+7. Markdown日报 + AI研报
+
+快捷选项：
+```bash
+python run_all_daily.py --fast        # 跳过新闻+图表（约3分钟）
+python run_all_daily.py --skip-ai     # 跳过AI研报
+python run_all_daily.py --skip-news   # 跳过新闻
+python run_all_daily.py --news-top-n 50  # 新闻覆盖前50只
+```
+
+### 🔧 偶尔运行（修改策略参数后）
+
+```bash
+python run_backtest_strategy_v3.py    # 重新跑回测
+python run_generate_report.py         # 生成回测HTML报告
+```
+
+### ⏰ 建议时间表
+
+| 时间 | 操作 | 耗时 |
+|------|------|------|
+| **每天 15:30后** | `python run_all_daily.py` | 5-10分钟 |
+| **每周末** | 跑上面的5步更新股票池 | 约20分钟 |
+| **调参后** | `python run_backtest_strategy_v3.py` | 几分钟 |
 
 ---
 
 ## 📁 项目结构
 
 ```
-├── quant/                          # 核心模块
-│   ├── providers/                  # 数据源（BaoStock/AkShare/Sina）
-│   ├── news_providers/             # 新闻源（东财/财联社/新浪/同花顺）
-│   ├── features.py                 # 特征工程（含涨停+TDX）
-│   ├── signals.py                  # 信号计算
-│   ├── tdx_indicators.py           # 通达信指标（月线）
-│   ├── market_regime.py            # 市场环境判断
-│   ├── fetch_daily.py              # 数据抓取（并行+缓存）
-│   ├── report_charts.py            # 研报图表生成
-│   ├── report_generator.py         # 研报内容生成
-│   └── report_quality.py           # 研报质量评估
-├── tools/                          # 工具脚本
-│   ├── build_signal_history.py     # 历史信号构建
-│   ├── run_backtest_from_signal.py # 信号回测
-│   └── report_metrics.py           # 回测指标
-├── data/                           # 数据目录
-│   ├── raw/                        # 原始数据
-│   ├── clean/                      # 清洗数据
-│   ├── features/                   # 特征数据
-│   ├── signals/                    # 信号数据
-│   └── reports/                    # AI研报
-├── out/                            # 输出目录
-│   ├── charts/                     # 图表
-│   └── latest_ai_report.md         # 最新研报
-├── run_all_daily.py                # 🚀 一键运行入口
-├── run_ai_report_v2.py             # AI研报（优化版）
-├── run_backtest_strategy_v3.py     # 历史回测+参数优化
-├── run_generate_chart_v3.py        # 回测图表生成
-├── config.yaml                     # 主配置文件
-├── config_optimized.yaml           # 优化后的参数配置
-└── .env                            # 环境变量
-```
-
----
-
-## 📊 策略说明
-
-### 选股流程（5层过滤）
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│  第一层  │ 市场环境过滤：沪深300 > MA200 才开仓              │
-├─────────────────────────────────────────────────────────────┤
-│  第二层  │ 可交易性过滤：排除一字板、涨停股（买不进）         │
-├─────────────────────────────────────────────────────────────┤
-│  第三层  │ 入场信号过滤：涨停回调 / 主力控盘 / TDX指标       │
-├─────────────────────────────────────────────────────────────┤
-│  第四层  │ 因子排序：多因子综合评分，选 Top 10               │
-├─────────────────────────────────────────────────────────────┤
-│  第五层  │ 仓位分配：波动反比 + 行业分散                     │
-└─────────────────────────────────────────────────────────────┘
-```
-
-### 入场条件（满足任一）
-
-#### 条件一：涨停回调入场
-- 近期（3-10天内）出现过涨停
-- 从涨停价回调 5%-25%
-- 当日放量突破（量 > 5日均量×1.3）
-- 收盘价站上 MA5
-
-#### 条件二：通达信指标入场（月线级别）
-| 指标 | 公式 | 条件 |
-|------|------|------|
-| **高30突破** | `HHV(EMA(X1, 3), 30)` | 30**月**内创新高 |
-| **主力控盘** | `(GU1 - REF(起爆,1)) / REF(起爆,1)` | > **50%** |
-| **涨停30日** | `MA(涨停标记, 30) × 10` | > 0.5（日线） |
-
-#### 条件三：简单趋势
-- 收盘价 > MA20
-
-### 风控体系
-
-| 风控类型 | 触发条件 | 说明 |
-|----------|----------|------|
-| 🔴 硬止损 | 亏损 -8% | 无条件止损 |
-| 🟡 移动止盈 | 从峰值回撤 10% | 锁定利润 |
-| 🔵 时间止损 | 持有超 15 天 | 避免长期套牢 |
-
-### 仓位控制
-
-| 市场状态 | 判断条件 | 建议仓位 |
-|----------|----------|----------|
-| 🟢 牛市 | >60%股票趋势向上 | 70-80% |
-| 🟡 震荡 | 中性 | 50-60% |
-| 🔴 熊市 | <40%股票趋势向上 | 30-40% |
-
-### 策略增强（v3新增）
-
-| 功能 | 说明 |
-|------|------|
-| 行业分散控制 | 单行业最多2只 |
-| 市值过滤 | 80亿-8000亿流通市值 |
-| 流动性过滤 | 20日成交额>6000万 |
-| 相关性控制 | 候选股相关性<0.75 |
-
----
-
-## 🔧 运行命令
-
-### 日常运行
-
-```bash
-# 完整流程
-python run_all_daily.py
-
-# 快速模式（约3-5分钟）
-python run_all_daily.py --fast
-
-# 跳过新闻
-python run_all_daily.py --skip-news
-
-# 跳过AI研报
-python run_all_daily.py --skip-ai
-
-# 跳过图表
-python run_all_daily.py --skip-charts
-```
-
-### 历史回测
-
-```bash
-# 普通回测
-python run_backtest_strategy_v3.py
-
-# 深度优化（网格搜索 + 5折交叉验证）
-python run_backtest_strategy_v3.py --optimize
-
-# 生成图表
-python run_generate_chart_v3.py
-```
-
-### 分步运行
-
-```bash
-python run_fetch_daily.py           # 1. 抓取数据
-python run_build_market_daily_all.py # 2. 构建市场数据
-python run_build_features_daily.py   # 3. 生成特征
-python run_make_daily_rank.py        # 4. 生成信号
-python run_fetch_news.py             # 5. 抓取新闻
-python run_ai_report_v2.py           # 6. AI研报
+├── ── 日常运行 ──
+├── run_all_daily.py                 ← 每日一键入口
+├── run_generate_report.py           ← 回测HTML报告（含交易统计）
+│
+├── ── 股票池管理（每周/月）──
+├── run_update_watchlist.py          ← 全市场扫描建池
+├── sync_watchlist.py                ← 同步缓存到配置文件
+│
+├── ── 数据流水线 ──
+├── run_fetch_daily.py               ← 获取日线数据
+├── run_build_market_daily_all.py    ← 合并行情
+├── run_build_features_daily.py      ← 构建特征
+├── run_make_daily_rank.py           ← 生成交易信号
+│
+├── ── 回测与优化 ──
+├── run_backtest_strategy_v3.py      ← 回测引擎（含参数优化）
+├── run_generate_chart_v3.py         ← 回测图表
+│
+├── ── 新闻与AI ──
+├── run_fetch_news.py                ← 新闻抓取（支持精准覆盖）
+├── run_build_ai_briefs.py           ← AI简报
+├── run_ai_report_v2.py              ← AI研报（优化版）
+│
+├── ── 配置 ──
+├── config_v31.yaml                  ← 主配置文件
+├── watchlist_cache.yaml             ← 股票池缓存（自动生成）
+├── .env                             ← API密钥
+│
+├── quant/                           ← 核心库
+│   ├── providers/                   ← 数据源（BaoStock/AKShare/Sina）
+│   ├── news_providers/              ← 新闻源（东财/财联社/新浪/同花顺）
+│   ├── features.py                  ← 特征工程
+│   ├── signals.py                   ← 信号计算
+│   ├── tdx_indicators.py            ← 通达信指标
+│   └── market_regime.py             ← 市场环境判断
+│
+├── data/
+│   ├── clean/market_daily/          ← 清洗后的日线
+│   ├── features/                    ← 特征数据
+│   ├── backtests/                   ← 回测结果+交易记录
+│   ├── signals/                     ← 交易信号
+│   └── reports/                     ← AI研报
+│
+└── out/                             ← 输出目录
+    ├── backtest_report.html         ← 回测报告
+    ├── charts/                      ← 图表
+    └── latest_ai_report.md          ← 最新研报
 ```
 
 ---
@@ -230,120 +207,37 @@ python run_ai_report_v2.py           # 6. AI研报
 
 | 路径 | 说明 |
 |------|------|
-| `data/signals/latest_daily_rank.csv` | **每日信号** |
-| `out/latest_ai_report.md` | **AI研报** |
-| `out/charts/` | 可视化图表 |
-| `data/features/features_daily.parquet` | 特征数据 |
-| `data/backtests/` | 回测结果 |
-| `config_optimized.yaml` | 优化后的参数 |
+| `data/signals/latest_daily_rank.csv` | 每日交易信号 |
+| `data/backtests/backtest_strategy_v3_trades.csv` | 交易记录（每笔买卖） |
+| `data/backtests/backtest_strategy_v3_equity.csv` | 权益曲线 |
+| `out/backtest_report.html` | 回测报告（含8项交易统计） |
+| `out/latest_ai_report.md` | AI研报 |
+| `watchlist_cache.yaml` | 股票池缓存 |
 
 ---
 
-## 📊 信号输出示例
+## 🔧 命令速查
 
-```
-╔══════════════════════════════════════════════════════════════╗
-║     🚀 A股智能量化交易系统 v3.0                              ║
-╚══════════════════════════════════════════════════════════════╝
-
-📋 今日信号 (Top 10)
-============================================================
-
-🎯 建议买入 (INVEST_MORE):
-代码      名称       得分   目标仓位   TDX分   高30突破   主力控盘
-600519   贵州茅台   3.52     15%      2.5       ✅         ✅
-000858   五粮液     3.21     12%      2.0       ✅         ✅
-300750   宁德时代   2.81     10%      1.5       ✅         ❌
-
-📊 目标仓位:
-   总仓位: 65%
-   现金: 35%
-```
-
----
-
-## 📝 AI研报功能（v2优化版）
-
-### 研报内容
-
-| 章节 | 内容 |
-|------|------|
-| 📈 市场概览 | 大盘状态、风险等级、热门板块 |
-| 🔥 行业轮动 | 行业涨跌幅、资金流向判断 |
-| 🎯 今日推荐 | 个股详细分析（技术面+TDX指标） |
-| ⚠️ 风险提示 | 风险因素识别 |
-| 📋 投资建议 | 操作建议、仓位建议 |
-
-### 可视化图表
-
-| 图表 | 说明 |
-|------|------|
-| 价格走势图 | 收盘价 + MA5/MA20 + 成交量 |
-| 技术指标图 | 布林带 + RSI + ATR |
-| 行业热力图 | 行业涨跌幅对比 |
-| 收益曲线 | 策略净值 + 回撤 |
-
-### 质量评估
-
-| 维度 | 说明 |
-|------|------|
-| 事实性 | 数据准确性 |
-| 一致性 | 格式规范性 |
-| 相关性 | 内容相关性 |
-| 完整性 | 章节完整性 |
-| 可读性 | 易读性 |
-
----
-
-## ❓ 常见问题
-
-### Q: 运行太慢？
 ```bash
-# 使用快速模式
-python run_all_daily.py --fast
+# ── 每天（收盘后跑）──
+python run_all_daily.py              # 完整流程（推荐）
+python run_all_daily.py --fast       # 快速（跳过新闻+图表）
+
+# ── 每周（周末跑）──
+python run_update_watchlist.py       # 更新股票池
+python sync_watchlist.py             # 同步到配置
+python run_fetch_daily.py            # 抓取数据
+python run_build_market_daily_all.py # 构建市场数据
+python run_build_features_daily.py   # 计算特征
+
+# ── 偶尔（改策略后跑）──
+python run_backtest_strategy_v3.py   # 回测
+python run_generate_report.py        # 生成报告
+
+# ── 单步调试 ──
+python run_make_daily_rank.py        # 只生成信号（看诊断输出）
+python run_fetch_news.py             # 只抓新闻
 ```
-
-### Q: Parquet 读取报错？
-```bash
-pip install pyarrow
-```
-
-### Q: 图表中文乱码？
-```bash
-pip install matplotlib
-# 然后安装中文字体（如 SimHei）
-```
-
-### Q: LLM API 调用失败？
-```bash
-# 检查 .env 配置
-DEEPSEEK_API_KEY=sk-xxx
-```
-
-### Q: `config_optimized.yaml` 是什么？
-这是运行参数优化后自动生成的配置文件，保存了最优参数。
-
----
-
-## 📋 版本历史
-
-### v3.0（当前）
-- ✅ 通达信指标改为**月线级别**
-- ✅ AI研报优化（可视化+质量评估）
-- ✅ 数据抓取优化（并行+缓存+增量）
-- ✅ 参数优化（网格搜索+交叉验证）
-- ✅ 策略增强（行业分散、市值过滤、流动性过滤、相关性控制）
-
-### v2.0
-- ✅ 涨停回调入场策略
-- ✅ 市场环境过滤
-- ✅ 多重风控
-- ✅ DeepSeek/MiMo 多模型
-
-### v1.0
-- 基础因子排序策略
-- 新闻聚合
-- DeepSeek AI研报
 
 ---
 
@@ -354,7 +248,22 @@ DEEPSEEK_API_KEY=sk-xxx
 - 过去表现不代表未来收益
 - 回测结果可能存在过拟合
 - 股市有风险，投资需谨慎
-- 请根据自身风险承受能力合理配置
+
+---
+
+## 📋 版本历史
+
+| 版本 | 年化 | 回撤 | 夏普 | 核心变化 |
+|------|------|------|------|----------|
+| **V3.2** | **26.16%** | — | **1.67** | 两阶段450只选股、五重风控、信号分级、盈利加仓 |
+| V3.1 | 16.44% | -13.6% | 1.27 | 行业分散、流动性过滤、TDX保护 |
+| V3.0 | ~20% | -18% | ~1.3 | 涨停回调+TDX指标+风控 |
+| V2.0 | ~18% | -22% | ~1.2 | 仓位控制+月线过滤 |
+| V1.0 | ~27% | -38% | ~1.18 | 纯因子排序，满仓运行 |
+
+---
+
+*配置文件：config_v31.yaml · 数据来源：BaoStock / AKShare / 新浪*
 
 ---
 

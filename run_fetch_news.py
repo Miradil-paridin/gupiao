@@ -2,6 +2,7 @@
 Fetch news from multiple sources for all watchlist stocks.
 + optional QC cleanup after fetch (drop placeholders/garbled/duplicates/too-old).
 + keep original JSON structure when writing back (dict stays dict, list stays list).
++ 支持 NEWS_SYMBOLS 环境变量：run_all_daily.py 传入时只抓信号前N的股票
 """
 from __future__ import annotations
 
@@ -372,11 +373,26 @@ def main() -> None:
     log_file = log_dir / "fetch_news.log"
     logger = setup_logger("quant", log_file=log_file)
 
+    # 优先读 config_v31.yaml
     cfg_path = base_dir / "config.yaml"
+    for name in ["config_v31.yaml", "config.yaml"]:
+        p = base_dir / name
+        if p.exists():
+            cfg_path = p
+            break
     with open(cfg_path, "r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
 
-    codes = cfg.get("watchlist", [])
+    # 优先从环境变量读取（run_all_daily.py 传入的 top N 信号股）
+    news_symbols_env = os.getenv("NEWS_SYMBOLS", "").strip()
+    if news_symbols_env:
+        codes = [c.strip() for c in news_symbols_env.split(",") if c.strip()]
+        logger.info(f"📰 NEWS_SYMBOLS: 只抓 {len(codes)} 只信号股的新闻")
+        print(f"📰 精准模式: 只抓 {len(codes)} 只信号股的新闻")
+    else:
+        codes = cfg.get("watchlist", [])
+        logger.info(f"📰 全量模式: 抓 {len(codes)} 只股票的新闻")
+        print(f"📰 全量模式: 抓 {len(codes)} 只股票的新闻")
     symbols = [_to_symbol(c) for c in codes if str(c).strip()]
 
     news_cfg = cfg.get("news", {})
@@ -390,6 +406,8 @@ def main() -> None:
 
     if args.as_of.strip():
         as_of = datetime.strptime(args.as_of.strip(), "%Y-%m-%d").date()
+    elif os.getenv("NEWS_AS_OF", "").strip():
+        as_of = datetime.strptime(os.getenv("NEWS_AS_OF").strip(), "%Y-%m-%d").date()
     else:
         as_of = date.today()
 

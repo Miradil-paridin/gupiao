@@ -158,130 +158,105 @@ def compute_market_overview(features: pd.DataFrame, signals: pd.DataFrame) -> Ma
     )
 
 
+
 def compute_industry_performance(features: pd.DataFrame, config_path: Path) -> Dict[str, float]:
     """计算行业表现"""
-    # 从config读取行业分组
-    import re
+    if not config_path.exists():
+        return {}
 
+    # 读取配置中的行业分组
     industry_map = {}
-    if config_path.exists():
-        try:
-            content = config_path.read_text(encoding="utf-8", errors="ignore")
-            current_industry = "其他"
+    current_industry = "其他"
 
-            for line in content.split('\n'):
-                # 检测行业分组标记
-                if "==========" in line:
-                    match = re.search(r'=+\s*([^=]+)\s*=+', line)
-                    if match:
-                        current_industry = match.group(1).strip()
+    with open(config_path, "r", encoding="utf-8") as f:
+        content = f.read()
 
-                # 检测股票代码
-                code_match = re.search(r'"(\d{6})"', line)
-                if code_match:
-                    code = code_match.group(1)
+    for line in content.split("\n"):
+        if "==========" in line:
+            if "消费" in line:
+                current_industry = "消费"
+            elif "医药" in line:
+                current_industry = "医药"
+            elif "科技" in line:
+                current_industry = "科技"
+            elif "金融" in line:
+                current_industry = "金融"
+            elif "新能源" in line:
+                current_industry = "新能源"
+            else:
+                current_industry = "其他"
+
+        if '"' in line:
+            try:
+                code = line.split('"')[1]
+                if code.isdigit():
                     industry_map[code] = current_industry
-                    if code.startswith(('6', '5')):
-                        industry_map[f"{code}.SH"] = current_industry
-                    else:
-                        industry_map[f"{code}.SZ"] = current_industry
-        except:
-            pass
+            except:
+                pass
 
     if not industry_map:
         return {}
 
-    # 计算各行业表现
+    # 最新日期
     latest_date = features["date"].max()
-    latest = features[features["date"] == latest_date].copy()
+    latest_feats = features[features["date"] == latest_date].copy()
 
-    # 添加行业标签
-    latest["industry"] = latest["symbol"].astype(str).map(industry_map)
-    latest = latest[latest["industry"].notna()]
-
-    if latest.empty:
-        return {}
+    # 分配行业
+    latest_feats["industry"] = latest_feats["symbol"].astype(str).map(
+        lambda s: industry_map.get(s, "其他")
+    )
 
     # 计算行业平均收益
-    if "ret_1d" in latest.columns:
-        ret_col = "ret_1d"
-    elif "ret_5d" in latest.columns:
-        ret_col = "ret_5d"
-    else:
-        return {}
+    industry_returns = latest_feats.groupby("industry")["ret_20d"].mean() * 100
 
-    industry_perf = latest.groupby("industry")[ret_col].mean() * 100
-
-    return industry_perf.to_dict()
+    return industry_returns.to_dict()
 
 
-def generate_charts(
-        base_dir: Path,
-        signals: pd.DataFrame,
-        features: pd.DataFrame,
-        industry_data: Dict[str, float],
-        stock_names: Dict[str, str],
-) -> Dict[str, Path]:
-    """生成所有图表"""
+def generate_charts(base_dir: Path, signals: pd.DataFrame, features: pd.DataFrame) -> Dict[str, str]:
+    """生成图表"""
     if not HAS_MATPLOTLIB:
-        print("  ⚠️ matplotlib 未安装，跳过图表生成")
+        print("  ⚠️ matplotlib 未安装，跳过图表")
         return {}
 
     charts = {}
     out_dir = base_dir / "out" / "charts"
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1. 信号汇总图
-    print("  - 生成信号汇总图...")
-    chart_path = create_signal_summary_chart(signals, out_dir / "signal_summary.png")
-    if chart_path:
-        charts["信号汇总"] = chart_path
+    # 选取前3只股票
+    top_stocks = signals[signals["action"] == "INVEST_MORE"].head(3)["symbol"].tolist()
 
-    # 2. 行业热力图
-    if industry_data:
-        print("  - 生成行业热力图...")
-        chart_path = create_industry_heatmap(
-            industry_data,
-            title="行业涨跌幅热力图",
-            output_path=out_dir / "industry_heatmap.png"
-        )
-        if chart_path:
-            charts["industry_heatmap"] = chart_path
-
-    # 3. 推荐股票的价格图和指标图
-    invest_more = signals[signals["action"] == "INVEST_MORE"].head(5)
-
-    for _, row in invest_more.iterrows():
-        symbol = str(row["symbol"]).upper()
-        name = stock_names.get(symbol, "")
-
-        # 获取该股票的历史数据
-        stock_data = features[features["symbol"].astype(str).str.upper() == symbol].copy()
-
-        if stock_data.empty:
-            continue
-
-        stock_data = stock_data.sort_values("date").tail(60)
-
-        # 价格图
-        print(f"  - 生成 {symbol} 价格走势图...")
-        price_path = create_price_chart(
-            stock_data, symbol, name,
-            days=30,
+    # 1. 价格走势 + 均线
+    for symbol in top_stocks:
+        chart_path = create_price_chart(
+            features,
+            symbol,
+            days=60,
             output_path=out_dir / f"price_{symbol}.png"
         )
-        if price_path:
-            charts[f"价格走势_{symbol}"] = price_path
+        if chart_path:
+            charts[f"价格走势_{symbol}"] = chart_path
 
-        # 指标图
-        print(f"  - 生成 {symbol} 技术指标图...")
+    # 2. 技术指标图
+    for symbol in top_stocks:
         indicator_path = create_indicator_chart(
-            stock_data, symbol, name,
+            features,
+            symbol,
             days=30,
             output_path=out_dir / f"indicator_{symbol}.png"
         )
         if indicator_path:
             charts[f"技术指标_{symbol}"] = indicator_path
+
+    # 3. 行业热力图
+    try:
+        heatmap_path = create_industry_heatmap(
+            features,
+            output_path=out_dir / "industry_heatmap.png"
+        )
+        if heatmap_path:
+            charts["行业热力图"] = heatmap_path
+    except Exception as e:
+        print(f"  ⚠️ 行业热力图生成失败: {e}")
 
     # 4. 收益曲线（如果有回测数据）
     equity_path = base_dir / "data" / "backtests" / "backtest_strategy_v3_equity.csv"
@@ -310,7 +285,11 @@ def call_llm_enhance(
     try:
         # 尝试导入LLM模块
         if provider == "deepseek":
-            from quant.llm_deepseek import call_deepseek
+            from quant.llm_deepseek import chat_complete
+
+            def call_deepseek(prompt_text: str) -> str:
+                resp = chat_complete(messages=[{"role": "user", "content": prompt_text}])
+                return resp.content.strip()
 
             prompt = f"""请基于以下研报草稿，进行内容增强和优化。
 
@@ -418,55 +397,44 @@ def main():
         print(f"   行业数: {len(industry_data)}")
         top3 = sorted(industry_data.items(), key=lambda x: x[1], reverse=True)[:3]
         for ind, ret in top3:
-            print(f"   - {ind}: {ret:+.2f}%")
-    else:
-        print("   ⚠️ 无行业数据")
+            print(f"   {ind}: {ret:+.2f}%")
 
-    # Step 4: 生成图表
-    charts = {}
-    if not args.skip_charts:
-        print("\n🎨 Step 4: 生成图表...")
-        charts = generate_charts(base_dir, signals, features, industry_data, stock_names)
-        print(f"   生成图表: {len(charts)} 个")
-    else:
-        print("\n🎨 Step 4: 跳过图表生成")
-
-    # Step 5: 生成研报内容
-    print("\n📝 Step 5: 生成研报内容...")
-    content = generate_report_content(
+    # Step 4: 生成基础研报
+    print("\n📝 Step 4: 生成基础研报...")
+    base_content = generate_report_content(
         signals=signals,
         features=features,
+        stock_names=stock_names,
         market_overview=market_overview,
         industry_data=industry_data,
-        stock_names=stock_names,
     )
-    content.charts = charts
+    report_md = render_report(base_content)
 
-    # 渲染Markdown
-    report_md = render_report(content, ai_model="DeepSeek")
+    # Step 5: 图表生成
+    charts = {}
+    if not args.skip_charts:
+        print("\n📉 Step 5: 生成图表...")
+        charts = generate_charts(base_dir, signals, features)
+        print(f"   图表数: {len(charts)}")
+    else:
+        print("\n📉 Step 5: 跳过图表生成")
 
-    # Step 6: AI增强（可选）
+    # Step 6: LLM增强
     if not args.skip_ai:
-        print("\n🤖 Step 6: AI增强...")
-        # 检查是否配置了LLM
-        if os.getenv("DEEPSEEK_API_KEY"):
-            report_md = call_llm_enhance(report_md, market_overview)
-            print("   ✅ AI增强完成")
-        else:
-            print("   ⚠️ 未配置LLM API，跳过AI增强")
+        print("\n🤖 Step 6: LLM增强...")
+        report_md = call_llm_enhance(report_md, market_overview)
     else:
         print("\n🤖 Step 6: 跳过AI增强")
 
-    # Step 7: 添加置信度和数据来源标注
-    print("\n📋 Step 7: 添加标注...")
-
-    # 置信度
-    invest_more = signals[signals["action"] == "INVEST_MORE"]
+    # Step 7: 添加信心标注 & 数据来源
+    print("\n✅ Step 7: 添加信心标注...")
     confidence_map = {}
+    invest_more = signals[signals["action"] == "INVEST_MORE"]
     for _, row in invest_more.iterrows():
         symbol = str(row["symbol"])
-        # 简单置信度计算
-        score = 0.5
+        score = row.get("score", 0)
+        score = float(score) if not np.isnan(score) else 0
+        score = min(score / 3.0, 1.0)
         if row.get("high30_breakout", 0) == 1:
             score += 0.2
         if row.get("main_force_strong", 0) == 1:
@@ -477,7 +445,6 @@ def main():
 
     report_md = add_confidence_annotations(report_md, confidence_map)
 
-    # 数据来源
     sources = [
         "BaoStock - 行情数据",
         "东方财富 - 新闻资讯",
@@ -508,7 +475,7 @@ def main():
     report_date = market_overview.date
     md_path, latest_path = save_report(base_dir, report_md, report_date, quality_report)
     print(f"   保存到: {md_path}")
-    print(f"   最新版: {latest_path}")
+    print(f"   最新: {latest_path}")
 
     # 完成
     print("\n" + "=" * 60)
