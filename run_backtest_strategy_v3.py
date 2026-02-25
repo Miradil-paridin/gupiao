@@ -5362,6 +5362,12 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Strategy V3 backtest")
     ap.add_argument("--base-dir", default=".", help="project root")
     ap.add_argument(
+        "--preset",
+        choices=["default", "target25"],
+        default="default",
+        help="quick preset for common workflows",
+    )
+    ap.add_argument(
         "--config",
         default=None,
         help="path to config yaml (default: config.yaml, fallback: config_v31.yaml)",
@@ -5516,6 +5522,22 @@ def main() -> None:
         for k, v in result["files"].items():
             print(f"{k}: {v}")
     else:
+        if args.preset == "target25":
+            # Keep explicit user inputs first; fill only missing values.
+            if args.watchlist is None:
+                args.no_default_watchlist = True
+            if not bool(args.dynamic_watchlist):
+                args.dynamic_watchlist = True
+            if int(args.dynamic_top_n) < 1000:
+                args.dynamic_top_n = 1000
+            if args.stop_loss_pct is None:
+                args.stop_loss_pct = 0.09
+            if args.trailing_stop_pct is None:
+                args.trailing_stop_pct = 0.12
+            if not args.enable_index_filter and not args.disable_index_filter:
+                args.disable_index_filter = True
+            print("  Preset active: target25 (full-universe dynamic pool, index filter off, SL/TS=9%/12%)")
+
         wl_file = args.watchlist
         if wl_file is None and not args.no_default_watchlist:
             for cand in ["backtest_watchlist.yaml", "watchlist_cache.yaml"]:
