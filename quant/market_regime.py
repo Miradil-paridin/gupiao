@@ -134,7 +134,30 @@ def compute_index_features(df: pd.DataFrame) -> pd.DataFrame:
         else:
             return "NEUTRAL"
 
-    df["regime"] = df.apply(classify_regime, axis=1)
+    df["regime_raw"] = df.apply(classify_regime, axis=1)
+
+    # Regime 平滑: 需要连续 3 天确认才切换状态，避免来回抖动
+    smoothed = []
+    prev_regime = "NEUTRAL"
+    confirm_count = 0
+    pending_regime = "NEUTRAL"
+    for raw in df["regime_raw"]:
+        if raw == prev_regime:
+            smoothed.append(prev_regime)
+            confirm_count = 0
+            pending_regime = prev_regime
+        elif raw == pending_regime:
+            confirm_count += 1
+            if confirm_count >= 3:
+                prev_regime = pending_regime
+                smoothed.append(prev_regime)
+            else:
+                smoothed.append(prev_regime)
+        else:
+            pending_regime = raw
+            confirm_count = 1
+            smoothed.append(prev_regime)
+    df["regime"] = smoothed
 
     # 是否允许开仓（两种规则可选）
     # 规则1（保守）：只在 BULL 时开仓

@@ -20,6 +20,13 @@ logger = get_logger("quant.providers")
 
 T = TypeVar("T")
 
+NON_RETRYABLE_KEYWORDS = (
+    "not installed",
+    "no module named",
+    "modulenotfounderror",
+    "unknown provider",
+)
+
 
 class ProviderError(Exception):
     """Exception raised when a provider fails to fetch data."""
@@ -58,6 +65,9 @@ def retry(
                 except exceptions as e:
                     last_exception = e
                     error_str = str(e).lower()
+                    if any(k in error_str for k in NON_RETRYABLE_KEYWORDS):
+                        logger.error(f"{func.__name__} non-retryable error: {e}")
+                        raise ProviderError(str(e)) from e
 
                     # Check if it's a network-related error
                     is_network_error = any(x in error_str for x in [

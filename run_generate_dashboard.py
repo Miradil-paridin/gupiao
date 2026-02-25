@@ -18,9 +18,16 @@
 from __future__ import annotations
 from pathlib import Path
 from datetime import date
+import sys
 import pandas as pd
 import yaml
 import json
+
+# Force UTF-8 console I/O on Windows to avoid Unicode print failures.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8")
 
 
 def load_ranking(base_dir: Path) -> pd.DataFrame:
@@ -40,7 +47,7 @@ def load_portfolio(base_dir: Path) -> dict:
 
 
 def load_config(base_dir: Path) -> dict:
-    for name in ["config_v31.yaml", "config.yaml"]:
+    for name in ["config.yaml"]:
         p = base_dir / name
         if p.exists():
             with open(p, "r", encoding="utf-8") as f:

@@ -1,272 +1,290 @@
-# A股智能量化交易系统 V3.2
+# A股量化交易系统（个人自用版）
 
-> 两阶段动态选股 · 涨停回调 · 主力控盘 · 五重风控 · 信号分级 · AI研报
+> 本项目定位为个人研究与实盘前验证工具，不是售卖产品。  
+> 目标不是“调一个神参数”，而是建立一套可持续迭代、可风控、可验证的策略工程流程。
 
-![Python](https://img.shields.io/badge/Python-3.10+-blue.svg)
-![License](https://img.shields.io/badge/License-MIT-green.svg)
+## 1. 这个程序是干什么的
 
----
+这是一个 A 股日度量化流水线，核心用途是：
 
-## 📈 回测业绩
+1. 自动更新行情与特征数据  
+2. 生成每日选股与目标权重（`latest_daily_rank.csv`）  
+3. 执行回测与样本外稳定性验证  
+4. 进行 paper trading 记账与持仓跟踪  
+5. 产出日报 / 仪表盘 / 回测报告，形成闭环
 
-| 指标 | V3.1（50只） | V3.2（450只） | 变化 |
-|------|-------------|--------------|------|
-| **年化收益** | 16.44% | **26.16%** | +10% ↑ |
-| **总收益** | — | **292.52%** | — |
-| **超额收益** | — | **278.80%** | — |
-| **夏普比率** | 1.27 | **1.67** | +0.4 ↑ |
-| **交易次数** | — | 1121笔 | — |
-| 回测区间 | 2020-01 → 2026-02 | 2020-01 → 2026-02 | — |
+一句话：`run_all_daily.py` 会把“数据 -> 信号 -> 回测 -> 风控 -> 报告”串成一条可重复执行的日常流程。
 
 ---
 
-## ✨ 系统亮点
+## 2. 当前进度（截至 2026-02-23）
 
-| 特性 | 说明 |
-|------|------|
-| 🔍 **两阶段选股** | 全市场5000只 → 通达信公式筛450只 → 日线策略选20只 |
-| 🎯 **精准入场** | 涨停回调 + 主力控盘 + 2-of-3多路径验证 |
-| 📊 **信号分级** | 强/普通/弱三级信号，自动调整仓位 |
-| 🛡️ **五重风控** | 硬止损/ATR止损/失败形态/动态止盈/时间止损 |
-| 💰 **盈利加仓** | 浮盈>5%自动加仓50%，让利润奔跑 |
-| 📰 **精准新闻** | 只抓信号前30只的新闻，不全覆盖 |
-| 🤖 **AI研报** | MiMo 大模型生成研报 + 新闻摘要 + 可视化图表 |
-| ⚡ **高性能** | 并行抓取 + LRU缓存 + 增量更新 |
+### 2.1 已落地能力（主流程 + 回测 + Paper）
 
-> **说明：** 交易决策（买卖、仓位）完全由量化策略（规则引擎+因子评分）做出，AI（MiMo）的角色是生成研报和分析新闻情绪，不参与交易决策。
+1. 策略治理流程（`tools/strategy_process_pipeline.py`）  
+方案：固定评估框架 + Walk-forward + rolling + 参数稳定区 + 风险情景层 + 双窗口失效监控。
+
+2. 交易闸门（`trade_gate`）  
+方案：`pass / warn / fail -> normal / reduce / stop`，并输出仓位上限，主流程与 paper 自动联动。
+
+3. 主流程联动（`run_all_daily.py`）  
+方案：优先读取新 `trade_gate`，兼容旧 `quality_gate/failure_monitor` 回退逻辑。
+
+4. 再平衡死区（`rebalance_band`）  
+方案：已在 paper 与回测双端生效，降低无效换手和摩擦成本。
+
+5. 执行现实性约束已接入治理  
+方案：`execution_slippage_drag`（硬约束）+ `avg_turnover_control`（告警约束）。
+
+6. 过拟合防护（PBO/DSR）已接入治理  
+方案：输出 `overfit_diagnostics`，并纳入 `quality_gate` 检查（`pbo_control`、`dsr_control`）。
+
+7. 动量崩盘保护已接入回测主仓位闸门  
+方案：识别“急跌后反抽”阶段并自动降仓，和 `index_filter/drawdown_brake` 叠加取更严上限。
+
+### 2.2 配置与参数联动状态
+
+1. `config.yaml` / `config_v31.yaml` 已接入：  
+`strategy.rebalance_band`、`paper_trading.rebalance_band`、`risk_control.momentum_crash_protection`。
+
+2. `run_all_daily.py` 已透传治理参数：  
+`monitor-short/long`、`warn-cap`、`gate-max-avg-turnover`、`gate-max-slippage-drag-pct`、`gate-max-pbo`、`gate-min-dsr`。
+
+3. `tools/strategy_process_pipeline.py` 已支持过拟合诊断参数：  
+`--overfit-max-combos`、`--overfit-cv-splits`、`--gate-max-pbo`、`--gate-min-dsr`。
+
+### 2.3 已完成验证（可复现实测）
+
+1. 语法检查通过：  
+`run_all_daily.py`、`run_backtest_strategy_v3.py`、`run_paper_trading.py`、`tools/strategy_process_pipeline.py`。
+
+2. 参数联动检查通过：  
+上述新增 CLI 参数在 `--help` 中可见，并可透传运行。
+
+3. 轻量治理实跑通过：  
+可产出 `trade_gate`、`overfit_diagnostics`、`quality_gate` 新检查项。
+
+4. 短区间回测实跑通过：  
+日志显示 `Momentum crash protection: on`，净值文件新增相关列。
+
+### 2.4 进度结论（当前阶段）
+
+1. 原 Phase A 的核心项已基本完成（交易闸门、双窗口监控、执行现实化）。  
+2. 现阶段重点已从“功能补齐”转为“阈值校准 + 稳定性增强 + 回归防漂移”。
+
+### 2.5 本次新增进度（2026-02-23，已落地）
+
+1. 退出逻辑优化已接入  
+- `rank_exit` 增加“仅趋势转弱才触发”过滤（`rank_exit_refine.only_when_trend_down: true`）。  
+- `ma_stop` 与 `trailing_stop` 同时命中时支持优先级仲裁（`exit_conflict_policy.ma_vs_trailing`）。
+
+2. 新闻情绪因子链路已打通（默认低权重关闭）  
+- 支持将新闻情绪并入打分并做 A/B。  
+- LLM provider 默认走 DeepSeek（环境变量可切换）。
+
+3. 新闻历史回补能力已接入主流程  
+- 新增脚本：`run_backfill_news_history.py`（区间回补、跳过已完成日期、强制重抓）。  
+- `run_all_daily.py` 已支持回补参数透传，并支持按配置自动周回补。  
+- 新增限流参数：`--max-days`、`--max-symbols`、`--latest-first`（避免一次跑太久超时）。
+
+4. 股票池工作流已明确  
+- 日常建议使用较小静态池跑主流程（速度快、结果稳定）。  
+- 夜间/每周更新 `watchlist_cache.yaml`，主流程自动用新池继续运行。
+
+5. 历史新闻回补实测进度（当前）  
+- 已完成新增日期：`2025-01-21/22/23/24/27`（以及此前已有日期）。  
+- 在 `2025-01-01 ~ 2026-02-23` 区间内，当前有 `manifest` 的交易日约 `17` 天，剩余约 `256` 天待补（按当前本地数据口径统计）。
 
 ---
 
-## 🚀 快速开始
+## 3. 当前默认策略口径（config.yaml，v31 为可切换基线）
 
-### 1. 环境配置
+- `top_k: 10`
+- `invest_more_n: 14`
+- `max_total_position: 0.92`
+- `stop_loss_pct: 0.08`
+- `trailing_stop_pct: 0.10`
+- `use_index_filter: true`
+- `index_filter_hard_gate: false`
+- `index_filter_block_position_cap: 0.30`
 
-```bash
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1  # Windows
-
-pip install -r requirements.txt
-pip install pyarrow matplotlib  # 可选
-```
-
-### 2. 配置文件
-
-**`.env` 环境变量：**
-```bash
-# LLM 选择（用于AI研报和新闻摘要，不影响交易决策）
-LLM_PROVIDER=mimo
-
-# MiMo 配置
-MIMO_API_KEY=your_key
-MIMO_MODEL=MiMo-7B-RL
-```
-
-**`config_v31.yaml` 策略配置：** 见下方策略说明。
-
-### 3. 首次运行（建立股票池+数据）
-
-```bash
-python run_update_watchlist.py        # 全市场扫描 → 450只
-python sync_watchlist.py              # 同步到配置文件
-python run_fetch_daily.py             # 抓取历史数据（首次15-30分钟）
-python run_build_market_daily_all.py  # 构建市场数据
-python run_build_features_daily.py    # 生成特征
-python run_backtest_strategy_v3.py    # 回测验证
-python run_generate_report.py         # 生成报告
-```
-
-### 4. 每日运行
-
-```bash
-python run_all_daily.py               # 一键完成全部流程
-python run_all_daily.py --fast        # 快速模式（跳过新闻+图表）
-python run_all_daily.py --skip-ai     # 跳过AI研报
-```
+说明：指数门控当前是“软门控降仓”而非“硬拦截禁开仓”。
+补充：`run_all_daily.py` 默认读取 `config.yaml`，若你要对比历史口径可用 `--config config_v31.yaml` 切换。
 
 ---
 
-## 🔄 运行流程
+## 4. 你现在如何日常使用
 
-### 🗓️ 每周一次（更新股票池，约20分钟）
-
-股票池会变化，需要定期从全市场重新筛选：
+### 4.1 常规日跑
 
 ```bash
-# Step 1: 全市场扫描 → 筛选出约500只
-python run_update_watchlist.py
-
-# Step 2: 同步到配置文件
-python sync_watchlist.py
-
-# Step 3: 抓取新股票的历史数据（首次约15分钟，之后增量秒过）
-python run_fetch_daily.py
-
-# Step 4: 构建市场数据
-python run_build_market_daily_all.py
-
-# Step 5: 计算特征（含通达信指标）
-python run_build_features_daily.py
-```
-
-### 📅 每天一次（生成信号+报告，约5-10分钟）
-
-```bash
-# 一键完成全部流程
 python run_all_daily.py
 ```
 
-`run_all_daily.py` 内部自动执行：
-1. 增量抓取今日行情（500只，约2分钟）
-2. 构建市场数据
-3. 更新特征
-4. **生成今日信号** → `data/signals/latest_daily_rank.csv`
-5. 只抓信号前30只的新闻（不全覆盖，省时间）
-6. AI简报
-7. Markdown日报 + AI研报
-
-快捷选项：
-```bash
-python run_all_daily.py --fast        # 跳过新闻+图表（约3分钟）
-python run_all_daily.py --skip-ai     # 跳过AI研报
-python run_all_daily.py --skip-news   # 跳过新闻
-python run_all_daily.py --news-top-n 50  # 新闻覆盖前50只
-```
-
-### 🔧 偶尔运行（修改策略参数后）
+### 4.2 快速模式（跳过部分耗时步骤）
 
 ```bash
-python run_backtest_strategy_v3.py    # 重新跑回测
-python run_generate_report.py         # 生成回测HTML报告
+python run_all_daily.py --fast
 ```
 
-### ⏰ 建议时间表
-
-| 时间 | 操作 | 耗时 |
-|------|------|------|
-| **每天 15:30后** | `python run_all_daily.py` | 5-10分钟 |
-| **每周末** | 跑上面的5步更新股票池 | 约20分钟 |
-| **调参后** | `python run_backtest_strategy_v3.py` | 几分钟 |
-
----
-
-## 📁 项目结构
-
-```
-├── ── 日常运行 ──
-├── run_all_daily.py                 ← 每日一键入口
-├── run_generate_report.py           ← 回测HTML报告（含交易统计）
-│
-├── ── 股票池管理（每周/月）──
-├── run_update_watchlist.py          ← 全市场扫描建池
-├── sync_watchlist.py                ← 同步缓存到配置文件
-│
-├── ── 数据流水线 ──
-├── run_fetch_daily.py               ← 获取日线数据
-├── run_build_market_daily_all.py    ← 合并行情
-├── run_build_features_daily.py      ← 构建特征
-├── run_make_daily_rank.py           ← 生成交易信号
-│
-├── ── 回测与优化 ──
-├── run_backtest_strategy_v3.py      ← 回测引擎（含参数优化）
-├── run_generate_chart_v3.py         ← 回测图表
-│
-├── ── 新闻与AI ──
-├── run_fetch_news.py                ← 新闻抓取（支持精准覆盖）
-├── run_build_ai_briefs.py           ← AI简报
-├── run_ai_report_v2.py              ← AI研报（优化版）
-│
-├── ── 配置 ──
-├── config_v31.yaml                  ← 主配置文件
-├── watchlist_cache.yaml             ← 股票池缓存（自动生成）
-├── .env                             ← API密钥
-│
-├── quant/                           ← 核心库
-│   ├── providers/                   ← 数据源（BaoStock/AKShare/Sina）
-│   ├── news_providers/              ← 新闻源（东财/财联社/新浪/同花顺）
-│   ├── features.py                  ← 特征工程
-│   ├── signals.py                   ← 信号计算
-│   ├── tdx_indicators.py            ← 通达信指标
-│   └── market_regime.py             ← 市场环境判断
-│
-├── data/
-│   ├── clean/market_daily/          ← 清洗后的日线
-│   ├── features/                    ← 特征数据
-│   ├── backtests/                   ← 回测结果+交易记录
-│   ├── signals/                     ← 交易信号
-│   └── reports/                     ← AI研报
-│
-└── out/                             ← 输出目录
-    ├── backtest_report.html         ← 回测报告
-    ├── charts/                      ← 图表
-    └── latest_ai_report.md          ← 最新研报
-```
-
----
-
-## 📈 输出文件
-
-| 路径 | 说明 |
-|------|------|
-| `data/signals/latest_daily_rank.csv` | 每日交易信号 |
-| `data/backtests/backtest_strategy_v3_trades.csv` | 交易记录（每笔买卖） |
-| `data/backtests/backtest_strategy_v3_equity.csv` | 权益曲线 |
-| `out/backtest_report.html` | 回测报告（含8项交易统计） |
-| `out/latest_ai_report.md` | AI研报 |
-| `watchlist_cache.yaml` | 股票池缓存 |
-
----
-
-## 🔧 命令速查
+### 4.3 临时忽略 gate（仅调试用）
 
 ```bash
-# ── 每天（收盘后跑）──
-python run_all_daily.py              # 完整流程（推荐）
-python run_all_daily.py --fast       # 快速（跳过新闻+图表）
+python run_all_daily.py --paper-ignore-gate
+```
 
-# ── 每周（周末跑）──
-python run_update_watchlist.py       # 更新股票池
-python sync_watchlist.py             # 同步到配置
-python run_fetch_daily.py            # 抓取数据
-python run_build_market_daily_all.py # 构建市场数据
-python run_build_features_daily.py   # 计算特征
+### 4.4 指定配置文件运行（对比 v31）
 
-# ── 偶尔（改策略后跑）──
-python run_backtest_strategy_v3.py   # 回测
-python run_generate_report.py        # 生成报告
-
-# ── 单步调试 ──
-python run_make_daily_rank.py        # 只生成信号（看诊断输出）
-python run_fetch_news.py             # 只抓新闻
+```bash
+python run_all_daily.py --config config_v31.yaml
 ```
 
 ---
 
-## ⚠️ 风险提示
+## 5. 主要输出文件
 
-**本系统仅供学习研究，不构成任何投资建议！**
-
-- 过去表现不代表未来收益
-- 回测结果可能存在过拟合
-- 股市有风险，投资需谨慎
-
----
-
-## 📋 版本历史
-
-| 版本 | 年化 | 回撤 | 夏普 | 核心变化 |
-|------|------|------|------|----------|
-| **V3.2** | **26.16%** | — | **1.67** | 两阶段450只选股、五重风控、信号分级、盈利加仓 |
-| V3.1 | 16.44% | -13.6% | 1.27 | 行业分散、流动性过滤、TDX保护 |
-| V3.0 | ~20% | -18% | ~1.3 | 涨停回调+TDX指标+风控 |
-| V2.0 | ~18% | -22% | ~1.2 | 仓位控制+月线过滤 |
-| V1.0 | ~27% | -38% | ~1.18 | 纯因子排序，满仓运行 |
-
----
-
-*配置文件：config_v31.yaml · 数据来源：BaoStock / AKShare / 新浪*
+- 信号：`data/signals/latest_daily_rank.csv`
+- 回测统计：`data/backtests/backtest_strategy_v3_stats.json`
+- 回测净值：`data/backtests/backtest_strategy_v3_equity.csv`
+- 策略治理汇总：`data/backtests/strategy_process_summary.json`
+- 策略治理报告：`data/backtests/strategy_process_report.md`
+- 策略健康诊断卡：`data/backtests/strategy_health_card.json`
+- 策略健康诊断卡（Markdown）：`data/reports/strategy_health_card_latest.md`
+- 闸门阈值校准：`data/backtests/strategy_gate_calibration.json`
+- 闸门阈值校准网格：`data/backtests/strategy_gate_calibration_grid.csv`
+- 闸门阈值校准报告：`data/reports/strategy_gate_calibration_latest.md`
+- Paper 状态：`data/paper/state.json`
+- Paper 交易：`data/paper/trades.csv`
+- Paper 净值：`data/paper/equity.csv`
+- 日度仪表盘：`out/daily_dashboard.html`
+- AI 研报仪表盘：`out/ai_report_dashboard.html`
+- 交易日志仪表盘：`out/trade_journal_dashboard.html`
+- 回测 HTML 报告：`out/backtest_report.html`
 
 ---
 
-## 📄 License
+## 6. 下一步优化方向（主线）
 
-MIT License
+你的主目标已经明确为 3 条：
+
+1. 长期正期望（expectancy > 0）  
+2. 可接受回撤（你睡得着）  
+3. 不同市场阶段不崩（鲁棒性）
+
+围绕这 3 条，后续只做“提升确定性”的优化，不做堆代码的花活。
+
+---
+
+## 7. 后续优化建议与方案（从“能跑”到“可长期维护”）
+
+### Phase 1（优先级 P1，近期 1-2 周）
+
+1. 治理阈值校准（交易闸门）
+方案：  
+按滚动时间段回放，校准 `warn/fail` 阈值，输出“阈值-收益-回撤”对照表，冻结一版生产默认值。
+
+2. PBO/DSR 稳定化
+方案：  
+扩大样本窗口并做敏感性分析，区分“研究模式阈值”和“生产模式阈值”，降低因短样本导致的误杀。
+
+3. 动量崩盘保护参数标定
+方案：  
+对 `drop/rebound/protection_days/position_cap` 做网格回放，形成“崩盘保护触发日志 + 恢复条件”。
+
+### Phase 2（优先级 P2，中期 2-4 周）
+
+1. 组合层风控增强
+方案：  
+增加行业暴露上限、相关性拥挤约束、单票波动约束，避免同因子抱团导致回撤共振。
+
+2. 执行仿真与实盘一致性进一步提高
+方案：  
+细化成交约束与冲击成本分层，统一回测与 paper 的成交假设，减少“回测可做、实盘做不到”。
+
+3. 样本外分层报告
+方案：  
+按牛/熊/震荡分段输出回测与治理结果，明确策略在不同市场状态下的边界。
+
+### Phase 3（优先级 P3，持续工程化）
+
+1. 自动化健康诊断卡
+方案：  
+每日输出策略健康状态、降仓原因、恢复条件和建议动作，支持快速复盘。
+
+2. 回归测试与防漂移
+方案：  
+建立关键指标基线，新增 CI 检查（阈值漂移、输出字段漂移、关键脚本参数漂移）。
+
+3. 策略分层（核心 + 卫星）
+方案：  
+核心仓位维持低换手稳健收益，卫星仓位承接事件驱动与高弹性机会。
+
+---
+
+## 8. 下一步执行方案（可直接续跑）
+
+### 8.1 短期（本周）
+
+1. 持续回补历史新闻（分批限流）  
+建议命令：  
+`python run_backfill_news_history.py --start-date 2025-01-01 --end-date 2026-02-23 --watchlist watchlist_cache.yaml --max-days 10 --max-symbols 80 --latest-first`
+
+2. 每补完一批，做一次快速核验  
+- 检查 `data/news/<date>/manifest.json` 是否新增。  
+- 检查 `data/backtests/backtest_strategy_v3_three_layer_report.json` 指标是否有边际改善。
+
+3. 新闻因子低权重 A/B（先验证再放大）  
+- 先用 `weight=0.05~0.08` 小步测试，重点看 WF Sharpe 与回撤变化。  
+- 若提升稳定再考虑提高权重。
+
+### 8.2 中期（下周）
+
+1. 组合构建升级（轻量风险预算约束优先，不上重优化器）。  
+2. 治理阈值二次校准（`trade_gate` / `PBO` / `DSR`）。  
+3. 固化一版“生产参数快照”并记录回归基线。
+
+---
+
+## 9. 近几次会话纪要（摘要）
+
+1. 会话 A（策略退出优化）  
+- 完成 `rank_exit` 趋势过滤与 `ma/trailing` 冲突仲裁。  
+- 做了固定 A/B 对照，结论是“趋势过滤保留更优”。
+
+2. 会话 B（股票池与实盘口径）  
+- 明确 `watchlist_cache.yaml` 是更新后的动态缓存池，`backtest_watchlist.yaml` 是较稳定的回测池。  
+- 建议“日常静态池 + 每周更新股票池”的运行节奏。
+
+3. 会话 C（新闻情绪因子接入）  
+- 完成因子并入打分链路（默认可关），并以低权重方式进入 A/B。  
+- DeepSeek 作为当前默认 LLM provider。
+
+4. 会话 D（新闻历史回补）  
+- 完成 `run_backfill_news_history.py` 与 `run_all_daily.py` 联动。  
+- 新增限流与最新优先参数，支持长期后台分批补齐。
+
+5. 会话 E（运行文档）  
+- 已补充 `RUNBOOK.md`，覆盖每日/每周运行命令与常用参数。
+
+注：会话中提到的收益指标以对应回测输出文件为准，不同股票池、日期区间、成本参数会导致结果差异。
+
+---
+
+## 10. 开发与运行建议
+
+```bash
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+```
+
+建议始终使用项目虚拟环境 `.venv` 运行，避免系统 Python 与依赖不一致。
+
+---
+
+## 11. 风险声明（必须看）
+
+1. 量化策略不存在“稳赚”，只能追求长期正期望与可控回撤。  
+2. 回测结果不代表未来收益，尤其在结构切换阶段。  
+3. 实盘前必须保留风控闸门，不建议关闭。  
+4. 任何新增策略都应先过样本外和稳定区，再考虑纳入主流程。

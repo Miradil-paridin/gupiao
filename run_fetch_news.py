@@ -93,20 +93,43 @@ def _item_time(item: dict) -> datetime | None:
 def _build_blacklist() -> list[str]:
     raw = os.getenv("NEWS_TITLE_BLACKLIST", "").strip()
     if not raw:
-        raw = "友情链接|联系我们|关于我们|免责声明|隐私|法律声明|内容合作|运营许可|站点地图|客服|广告服务|投稿|APP下载"
+        raw = (
+            "友情链接|联系我们|关于我们|免责声明|隐私|法律声明|内容合作|运营许可|站点地图|客服|广告服务|投稿|APP下载"
+            "|意见反馈|留言板|常见问题|举报|contact us|privacy|terms|feedback"
+            "|鍙嬫儏閾炬帴|鑱旂郴鎴戜滑|杩愯惀璁稿彲|娉曞緥澹版槑|鍐呭鍚堜綔|绔欑偣鍦板浘|骞垮憡鏈嶅姟|APP涓嬭浇"
+        )
     return [x.strip() for x in raw.split("|") if x.strip()]
+
+
+def _looks_like_mojibake(title: str) -> bool:
+    t = str(title or "").strip()
+    if not t:
+        return False
+    bad_tokens = (
+        "鍙嬫儏閾炬帴",
+        "鑱旂郴鎴戜滑",
+        "杩愯惀璁稿彲",
+        "娉曞緥澹版槑",
+        "鍐呭鍚堜綔",
+        "绔欑偣鍦板浘",
+        "骞垮憡鏈嶅姟",
+        "APP涓嬭浇",
+    )
+    return any(tok in t for tok in bad_tokens)
 
 
 def _is_bad_title(title: str, blacklist: list[str], min_len: int, drop_garbled: bool) -> bool:
     if not title:
         return True
     t = title.strip()
+    tl = t.lower()
     if len(t) < min_len:
         return True
-    if drop_garbled and "�" in t:
+    if drop_garbled and ("�" in t or _looks_like_mojibake(t)):
         return True
     for b in blacklist:
-        if b and b in t:
+        b2 = str(b).strip()
+        if b2 and ((b2 in t) or (b2.lower() in tl)):
             return True
     return False
 
@@ -190,12 +213,15 @@ def _qc_clean_news_folder(news_dir: Path, as_of: date, logger) -> Path | None:
         return None
 
     max_age_days = int(os.getenv("NEWS_MAX_AGE_DAYS", "7"))
+    max_future_days = int(os.getenv("NEWS_MAX_FUTURE_DAYS", "1"))
     min_len = int(os.getenv("NEWS_MIN_TITLE_LEN", "6"))
     drop_garbled = os.getenv("NEWS_DROP_GARBLED", "1").strip() in ("1", "true", "True", "YES", "yes")
+    drop_no_time = os.getenv("NEWS_DROP_NO_TIME", "1").strip() in ("1", "true", "True", "YES", "yes")
     backup_raw = os.getenv("NEWS_QC_BACKUP_RAW", "1").strip() in ("1", "true", "True", "YES", "yes")
     blacklist = _build_blacklist()
 
     cutoff_dt = datetime.combine(as_of, datetime.min.time()) - timedelta(days=max_age_days)
+    future_cutoff_dt = datetime.combine(as_of + timedelta(days=max_future_days), datetime.max.time())
 
     raw_dir = news_dir / "_raw"
     if backup_raw:
@@ -205,8 +231,10 @@ def _qc_clean_news_folder(news_dir: Path, as_of: date, logger) -> Path | None:
         "as_of": str(as_of),
         "news_dir": str(news_dir),
         "max_age_days": max_age_days,
+        "max_future_days": max_future_days,
         "min_title_len": min_len,
         "drop_garbled": drop_garbled,
+        "drop_no_time": drop_no_time,
         "blacklist_count": len(blacklist),
         "files": [],
     }
@@ -238,7 +266,7 @@ def _qc_clean_news_folder(news_dir: Path, as_of: date, logger) -> Path | None:
         if isinstance(root_obj, dict) and items_key == "__symbol_map__":
             before_total = 0
             after_total = 0
-            dropped_total = {"bad_title": 0, "too_old": 0, "dup": 0}
+            dropped_total = {"bad_title": 0, "too_old": 0, "no_time": 0, "future_time": 0, "dup": 0}
 
             new_map = {}
             for sym, lst in root_obj.items():
@@ -248,7 +276,7 @@ def _qc_clean_news_folder(news_dir: Path, as_of: date, logger) -> Path | None:
 
                 kept = []
                 seen = set()
-                dropped = {"bad_title": 0, "too_old": 0, "dup": 0}
+                dropped = {"bad_title": 0, "too_old": 0, "no_time": 0, "future_time": 0, "dup": 0}
 
                 for it in lst:
                     if not isinstance(it, dict):
@@ -260,8 +288,14 @@ def _qc_clean_news_folder(news_dir: Path, as_of: date, logger) -> Path | None:
                     if _is_bad_title(title, blacklist, min_len, drop_garbled):
                         dropped["bad_title"] += 1
                         continue
+                    if dt is None and drop_no_time:
+                        dropped["no_time"] += 1
+                        continue
                     if dt and dt < cutoff_dt:
                         dropped["too_old"] += 1
+                        continue
+                    if dt and dt > future_cutoff_dt:
+                        dropped["future_time"] += 1
                         continue
                     key = (title, source, dt.isoformat() if dt else "")
                     if key in seen:
@@ -302,7 +336,7 @@ def _qc_clean_news_folder(news_dir: Path, as_of: date, logger) -> Path | None:
 
         kept = []
         seen = set()
-        dropped = {"bad_title": 0, "too_old": 0, "dup": 0}
+        dropped = {"bad_title": 0, "too_old": 0, "no_time": 0, "future_time": 0, "dup": 0}
 
         for it in items:
             title = (it.get("title") or it.get("headline") or "").strip()
@@ -312,8 +346,14 @@ def _qc_clean_news_folder(news_dir: Path, as_of: date, logger) -> Path | None:
             if _is_bad_title(title, blacklist, min_len, drop_garbled):
                 dropped["bad_title"] += 1
                 continue
+            if dt is None and drop_no_time:
+                dropped["no_time"] += 1
+                continue
             if dt and dt < cutoff_dt:
                 dropped["too_old"] += 1
+                continue
+            if dt and dt > future_cutoff_dt:
+                dropped["future_time"] += 1
                 continue
 
             key = (title, source, dt.isoformat() if dt else "")
@@ -373,13 +413,23 @@ def main() -> None:
     log_file = log_dir / "fetch_news.log"
     logger = setup_logger("quant", log_file=log_file)
 
-    # 优先读 config_v31.yaml
-    cfg_path = base_dir / "config.yaml"
-    for name in ["config_v31.yaml", "config.yaml"]:
-        p = base_dir / name
+    # 加载配置（优先 PIPELINE_CONFIG）
+    cfg_path = None
+    env_cfg = os.getenv("PIPELINE_CONFIG", "").strip()
+    if env_cfg:
+        p = Path(env_cfg)
+        if not p.is_absolute():
+            p = base_dir / p
         if p.exists():
             cfg_path = p
-            break
+    if cfg_path is None:
+        for name in ["config.yaml", "config_v31.yaml"]:
+            p = base_dir / name
+            if p.exists():
+                cfg_path = p
+                break
+    if cfg_path is None:
+        raise FileNotFoundError("No config found (expected config.yaml or config_v31.yaml)")
     with open(cfg_path, "r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
 
@@ -403,6 +453,24 @@ def main() -> None:
     cfg_max_age = news_cfg.get("max_age_days")
     if cfg_max_age is not None and not os.getenv("NEWS_MAX_AGE_DAYS"):
         os.environ["NEWS_MAX_AGE_DAYS"] = str(int(cfg_max_age))
+    cfg_min_title_len = news_cfg.get("min_title_len")
+    if cfg_min_title_len is not None and not os.getenv("NEWS_MIN_TITLE_LEN"):
+        os.environ["NEWS_MIN_TITLE_LEN"] = str(int(cfg_min_title_len))
+    cfg_drop_garbled = news_cfg.get("drop_garbled")
+    if cfg_drop_garbled is not None and not os.getenv("NEWS_DROP_GARBLED"):
+        os.environ["NEWS_DROP_GARBLED"] = "1" if bool(cfg_drop_garbled) else "0"
+    cfg_drop_no_time = news_cfg.get("drop_no_time")
+    if cfg_drop_no_time is not None and not os.getenv("NEWS_DROP_NO_TIME"):
+        os.environ["NEWS_DROP_NO_TIME"] = "1" if bool(cfg_drop_no_time) else "0"
+    cfg_max_future_days = news_cfg.get("max_future_days")
+    if cfg_max_future_days is not None and not os.getenv("NEWS_MAX_FUTURE_DAYS"):
+        os.environ["NEWS_MAX_FUTURE_DAYS"] = str(int(cfg_max_future_days))
+    cfg_title_blacklist = news_cfg.get("title_blacklist")
+    if cfg_title_blacklist is not None and not os.getenv("NEWS_TITLE_BLACKLIST"):
+        if isinstance(cfg_title_blacklist, list):
+            os.environ["NEWS_TITLE_BLACKLIST"] = "|".join(str(x).strip() for x in cfg_title_blacklist if str(x).strip())
+        elif str(cfg_title_blacklist).strip():
+            os.environ["NEWS_TITLE_BLACKLIST"] = str(cfg_title_blacklist).strip()
 
     if args.as_of.strip():
         as_of = datetime.strptime(args.as_of.strip(), "%Y-%m-%d").date()
@@ -414,7 +482,11 @@ def main() -> None:
     logger.info(f"Fetching news for {len(symbols)} symbols")
     logger.info(f"Providers: {provider_names}")
     logger.info(f"Max items per symbol: {max_items}, include market news: {include_market}")
-    logger.info(f"As of: {as_of}, NEWS_MAX_AGE_DAYS: {os.getenv('NEWS_MAX_AGE_DAYS', '7')}")
+    logger.info(
+        f"As of: {as_of}, NEWS_MAX_AGE_DAYS: {os.getenv('NEWS_MAX_AGE_DAYS', '7')}, "
+        f"NEWS_DROP_NO_TIME: {os.getenv('NEWS_DROP_NO_TIME', '1')}, "
+        f"NEWS_MAX_FUTURE_DAYS: {os.getenv('NEWS_MAX_FUTURE_DAYS', '1')}"
+    )
 
     manifest_path = run_fetch_all_news(
         symbols=symbols,

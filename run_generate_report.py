@@ -21,7 +21,7 @@ except ImportError:
 # ── 配置 ──────────────────────────────────────────────────
 
 def load_project_config(base_dir: Path) -> dict:
-    for name in ["config_v31.yaml", "config_optimized.yaml", "config.yaml"]:
+    for name in ["config.yaml"]:
         p = base_dir / name
         if p.exists():
             try:

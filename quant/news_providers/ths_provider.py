@@ -59,6 +59,31 @@ class THSNewsProvider(NewsProvider):
         """Convert 6-digit code to THS format."""
         # THS uses just the 6-digit code
         return code6
+
+    def _extract_date_from_url(self, url: str) -> Optional[datetime]:
+        if not url:
+            return None
+        s = str(url)
+        m = re.search(r"(20\d{2}-\d{2}-\d{2})", s)
+        if m:
+            return self._parse_datetime(m.group(1))
+        m = re.search(r"(20\d{6})", s)
+        if m:
+            raw = m.group(1)
+            return self._parse_datetime(f"{raw[0:4]}-{raw[4:6]}-{raw[6:8]}")
+        return None
+
+    def _is_noise_title(self, title: str) -> bool:
+        t = str(title or "").strip()
+        if not t:
+            return True
+        noise_keywords = (
+            "友情链接", "联系我们", "关于我们", "免责声明", "法律声明", "隐私",
+            "内容合作", "运营许可", "站点地图", "广告服务", "投稿", "APP下载",
+            "contact us", "privacy", "terms", "feedback",
+        )
+        tl = t.lower()
+        return any((k in t) or (k in tl) for k in noise_keywords)
     
     @retry_news(max_attempts=3, delay=1.0, backoff=2.0)
     def fetch_stock_news(
@@ -116,19 +141,19 @@ class THSNewsProvider(NewsProvider):
                     title = match[1].strip()
                     date_str = match[2].strip() if len(match) > 2 else ""
                     
-                    if not title or len(title) < 3:
+                    if not title or len(title) < 6 or self._is_noise_title(title):
                         continue
                     
                     # Filter out non-news links
                     if "10jqka.com.cn" not in url_match and not url_match.startswith("http"):
                         continue
                     
-                    pub_time = self._parse_datetime(date_str)
+                    pub_time = self._parse_datetime(date_str) or self._extract_date_from_url(url_match)
                     
                     items.append(NewsItem(
                         title=title,
                         content="",
-                        publish_time=pub_time or datetime.now(),
+                        publish_time=pub_time,
                         source=self.name,
                         url=url_match,
                         stock_codes=[code6],
@@ -161,13 +186,15 @@ class THSNewsProvider(NewsProvider):
                 title = str(row.get("新闻标题", ""))
                 content = str(row.get("新闻内容", ""))[:300]
                 time_str = str(row.get("发布时间", ""))
+                if not title or title.lower() == "nan":
+                    continue
                 
                 pub_time = self._parse_datetime(time_str)
                 
                 items.append(NewsItem(
                     title=title,
                     content=content,
-                    publish_time=pub_time or datetime.now(),
+                    publish_time=pub_time,
                     source=f"{self.name}_fallback",
                     stock_codes=[code6],
                     category="news",
@@ -223,11 +250,13 @@ class THSNewsProvider(NewsProvider):
             title = title.strip()
             if not title or len(title) < 5:
                 continue
+            if self._is_noise_title(title):
+                continue
             
             items.append(NewsItem(
                 title=title,
                 content="",
-                publish_time=datetime.now(),
+                publish_time=self._extract_date_from_url(url_match),
                 source=self.name,
                 url=url_match,
                 stock_codes=[],
@@ -288,7 +317,7 @@ class THSNewsProvider(NewsProvider):
             items.append(NewsItem(
                 title=title,
                 content="",
-                publish_time=datetime.now(),
+                publish_time=self._extract_date_from_url(url_match),
                 source=self.name,
                 url=url_match if url_match.startswith("http") else f"http:{url_match}",
                 stock_codes=[code6],

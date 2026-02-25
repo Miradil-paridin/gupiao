@@ -249,8 +249,13 @@ def generate_charts(base_dir: Path, signals: pd.DataFrame, features: pd.DataFram
 
     # 3. 行业热力图
     try:
+        # create_industry_heatmap 需要 {行业:涨跌幅} 字典，而不是 DataFrame
+        config_path = base_dir / "config.yaml"
+        if not config_path.exists():
+            config_path = base_dir / "config.yaml"
+        industry_data = compute_industry_performance(features, config_path)
         heatmap_path = create_industry_heatmap(
-            features,
+            industry_data,
             output_path=out_dir / "industry_heatmap.png"
         )
         if heatmap_path:

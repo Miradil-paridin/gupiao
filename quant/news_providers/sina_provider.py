@@ -62,6 +62,31 @@ class SinaNewsProvider(NewsProvider):
             return f"sh{code6}"
         else:
             return f"sz{code6}"
+
+    def _extract_date_from_url(self, url: str) -> Optional[datetime]:
+        if not url:
+            return None
+        s = str(url)
+        m = re.search(r"(20\d{2}-\d{2}-\d{2})", s)
+        if m:
+            return self._parse_datetime(m.group(1))
+        m = re.search(r"(20\d{6})", s)
+        if m:
+            raw = m.group(1)
+            return self._parse_datetime(f"{raw[0:4]}-{raw[4:6]}-{raw[6:8]}")
+        return None
+
+    def _is_noise_title(self, title: str) -> bool:
+        t = str(title or "").strip()
+        if not t:
+            return True
+        noise_keywords = (
+            "友情链接", "联系我们", "关于我们", "免责声明", "法律声明", "隐私",
+            "意见反馈", "留言板", "常见问题", "举报", "广告服务", "投稿", "APP下载",
+            "contact us", "privacy", "terms", "feedback",
+        )
+        tl = t.lower()
+        return any((k in t) or (k in tl) for k in noise_keywords)
     
     @retry_news(max_attempts=3, delay=1.0, backoff=2.0)
     def fetch_stock_news(
@@ -109,19 +134,16 @@ class SinaNewsProvider(NewsProvider):
         matches = re.findall(pattern, html)
         
         for url_match, title in matches[:max_items]:
-            if not title.strip():
+            title = title.strip()
+            if not title or len(title) < 6 or self._is_noise_title(title):
                 continue
             
-            # Try to extract date from URL or nearby text
-            date_match = re.search(r"(\d{4}-\d{2}-\d{2})", url_match)
-            pub_time = None
-            if date_match:
-                pub_time = self._parse_datetime(date_match.group(1))
+            pub_time = self._extract_date_from_url(url_match)
             
             items.append(NewsItem(
-                title=title.strip(),
+                title=title,
                 content="",  # Would need to fetch full article
-                publish_time=pub_time or datetime.now(),
+                publish_time=pub_time,
                 source=self.name,
                 url=url_match if url_match.startswith("http") else f"https:{url_match}",
                 stock_codes=[code6],
@@ -149,11 +171,15 @@ class SinaNewsProvider(NewsProvider):
             for _, row in df.head(max_items).iterrows():
                 title = str(row.get("新闻标题", ""))
                 content = str(row.get("新闻内容", ""))[:300]
+                time_str = str(row.get("发布时间", row.get("publish_time", "")))
+                pub_time = self._parse_datetime(time_str)
+                if not title or title.lower() == "nan":
+                    continue
                 
                 items.append(NewsItem(
                     title=title,
                     content=content,
-                    publish_time=datetime.now(),
+                    publish_time=pub_time,
                     source="sina_fallback",
                     stock_codes=[code6],
                     category="news",
@@ -209,13 +235,15 @@ class SinaNewsProvider(NewsProvider):
             title = title.strip()
             if not title or len(title) < 5:
                 continue
+            if self._is_noise_title(title):
+                continue
             if "finance.sina.com.cn" not in url_match and "sina.com.cn" not in url_match:
                 continue
             
             items.append(NewsItem(
                 title=title,
                 content="",
-                publish_time=datetime.now(),
+                publish_time=self._extract_date_from_url(url_match),
                 source=self.name,
                 url=url_match,
                 stock_codes=[],

@@ -126,7 +126,7 @@ class CLSNewsProvider(NewsProvider):
                     items.append(NewsItem(
                         title=title,
                         content=content[:500] if content else "",
-                        publish_time=pub_time or datetime.now(),
+                        publish_time=pub_time,
                         source=self.name,
                         stock_codes=[],
                         category="telegraph",
@@ -144,14 +144,16 @@ class CLSNewsProvider(NewsProvider):
                 for _, row in df_depth.head(max_items - len(items)).iterrows():
                     title = str(row.get("标题", row.get("title", "")))
                     content = str(row.get("内容", row.get("content", "")))
+                    time_str = str(row.get("时间", row.get("发布时间", row.get("日期", ""))))
                     
                     if not title:
                         continue
+                    pub_time = self._parse_datetime(time_str)
                     
                     items.append(NewsItem(
                         title=title,
                         content=content[:500] if content else "",
-                        publish_time=datetime.now(),
+                        publish_time=pub_time,
                         source=f"{self.name}_global",
                         stock_codes=[],
                         category="market",
@@ -202,7 +204,7 @@ class CLSNewsProvider(NewsProvider):
                 items.append(NewsItem(
                     title=title,
                     content=content,
-                    publish_time=pub_time or datetime.now(),
+                    publish_time=pub_time,
                     source=self.name,
                     stock_codes=[],
                     category="telegraph",

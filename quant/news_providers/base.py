@@ -61,8 +61,6 @@ class NewsItem:
                 pub_time = datetime.fromisoformat(pub_time)
             except ValueError:
                 pub_time = None
-        if pub_time is None:
-            pub_time = datetime.now()
         
         return cls(
             title=d.get("title", ""),

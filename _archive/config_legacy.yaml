@@ -278,181 +278,64 @@ providers:
   - sina
   fallback_enabled: true
 strategy:
-  top_k: 10
-  invest_more_n: 14
+  top_k: 15
+  invest_more_n: 15
   least_n: 3
   use_tradeability_filter: true
   use_limit_up_pullback: true
-  pullback_window_start: 2
-  pullback_window_end: 15
-  pullback_min_pct: 0.05
-  pullback_max_pct: 0.35
+  pullback_window_start: 3
+  pullback_window_end: 10
+  pullback_min_pct: 0.1
+  pullback_max_pct: 0.3
   use_tdx_indicators: true
   tdx_high30_weight: 1.0
   tdx_main_force_weight: 1.5
   tdx_limit_up_30d_weight: 0.5
   tdx_min_score: 2.2
   use_volatility_sizing: true
-  volatility_sizing:
-    enabled: true
-    lookback_days: 20
-    target_annual: 0.22
-    floor_annual: 0.08
-    min_multiplier: 0.65
-    max_multiplier: 1.15
-  liquidity_state_sizing:
-    enabled: false
-    lookback_days: 60
-    sensitivity: 0.5
-    min_multiplier: 0.85
-    max_multiplier: 1.05
-  risk_budget:
-    enabled: true
-    mode: inverse_atr
-    atr_floor: 0.005
-    power: 1.0
-    min_multiplier: 0.7
-    max_multiplier: 1.45
-    blend: 0.65
-  max_single_weight: 0.12
-  rebalance_band: 0.01
-  dynamic_rebalance_band:
-    enabled: true
-    sensitivity: 0.8
-    signal_ref: 1.0
-    cost_ref_bps: 20.0
-    min_band: 0.005
-    max_band: 0.03
-  max_total_position: 0.92
+  max_single_weight: 0.15
+  max_total_position: 0.8
   use_market_regime: true
-  dynamic_position_by_regime:
-    enabled: true
-    bull_cap: 0.95
-    neutral_cap: 0.7
-    bear_cap: 0.25
-  weak_signal_de_risk:
-    enabled: true
-    threshold: 1.1
-    cap_multiplier: 0.75
-  layered_entry:
-    enabled: true
-    regime_gate_enabled: true
-    bull_min_strength: 0.5
-    neutral_min_strength: 1.0
-    bear_min_strength: 2.0
-    strong_threshold: 2.0
-    normal_threshold: 1.0
-    weak_mode: micro
-    weak_micro_max_new: 3
-    weak_micro_weight_multiplier: 1.0
   industry_diversification:
     enabled: true
-    max_per_industry: 3
+    max_per_industry: 2
   market_cap_filter:
     enabled: true
-    min_float_mkt_cap: 3.0e9
+    min_float_mkt_cap: 8.0e9
     max_float_mkt_cap: 8.0e11
   liquidity_filter:
     enabled: true
-    min_amount_20d: 5.0e7
-    min_turnover_20d: 0.4
+    min_amount_20d: 6.0e7
+    min_turnover_20d: 0.6
   correlation_control:
     enabled: true
     corr_lookback_days: 60
-    max_pairwise_corr: 0.8
+    max_pairwise_corr: 0.75
   alpha_enhancement:
-    enabled: true
+    enabled: false
     industry_rs_weight: 0.05
-    flow_persistence_weight: 0.22
-    quality_weight: 0.04
+    flow_persistence_weight: 0.20
+    quality_weight: 0.05
     short_reversal_weight: 0.03
     turnover_reversal_weight: 0.02
     value_proxy_weight: 0.01
-  news_sentiment_factor:
-    enabled: false
-    weight: 0.08
-    min_items: 3
-    lag_days: 1
-  factor_preprocess:
-    robust_zscore: true
-    winsorize_quantile: 0.02
-    neutralize:
-      industry: true
-      size: true
-      beta: false
-    size_col: float_mkt_cap_20d
-    beta_col: beta_60d
-  entry_mode: normal
-  normal_min_conditions: 2
-  use_signal_tiered_sizing: true
+  entry_mode: custom
   use_profit_pyramiding: false
   use_rank_exit: true
   rank_exit_rebalance_freq: W
   rank_exit_min_hold_days: 5
-  rank_exit_refine:
-    rank_buffer: 2
-    only_when_trend_down: true
-  pyramid_trigger_pct: 0.05
-  pyramid_add_ratio: 0.5
 risk_control:
   use_stop_loss: true
-  stop_loss_pct: 0.08
+  stop_loss_pct: 0.06
   use_trailing_stop: true
-  trailing_stop_pct: 0.1
+  trailing_stop_pct: 0.08
   use_time_stop: true
-  max_hold_days: 20
+  max_hold_days: 15
   use_ma_stop: true
   ma_stop_days: 2
   use_tdx_protection: true
   tdx_protection_threshold: 2.0
   use_index_filter: true
-  index_filter_hard_gate: false
-  index_filter_block_position_cap: 0.3
-  momentum_crash_protection:
-    enabled: true
-    crash_lookback_days: 8
-    crash_drop_threshold: -0.08
-    rebound_lookback_days: 3
-    rebound_threshold: 0.03
-    protection_days: 5
-    position_cap: 0.45
-  use_atr_stop: true
-  atr_stop_multiplier: 2.0
-  use_failure_stop: true
-  failure_stop_days: 2
-  failure_stop_gain: 0.03
-  exit_conflict_policy:
-    ma_vs_trailing: trailing
-  failure_stop_refine:
-    require_negative_pnl: true
-    negative_pnl_threshold: 0.0
-    weak_signal_only: true
-    max_signal_strength: 1.0
-    skip_if_still_target: true
-    skip_if_trend_up: true
-  portfolio_drawdown_brake:
-    enabled: true
-    threshold: 0.1
-    pause_days: 10
-    position_cap: 0.3
-  adaptive_drawdown_mode:
-    enabled: false
-    trigger: 0.04
-    position_cap_multiplier: 0.8
-    gate_boost: 0.5
-    top_k_multiplier: 0.7
-    invest_more_multiplier: 0.8
-    stop_loss_multiplier: 0.9
-    trailing_multiplier: 0.85
-    max_hold_multiplier: 0.8
-paper_trading:
-  initial_cash: 100000
-  lot_size: 100
-  slippage_bps: 5
-  buy_fee_bps: 2
-  sell_fee_bps: 12
-  rebalance_band: 0.01
-  sync_portfolio_yaml: false
 news:
   sources:
   - eastmoney
@@ -461,15 +344,6 @@ news:
   - ths
   max_per_source: 20
   include_in_ai: true
-  news_top_n: 30
-  backfill:
-    enabled: false
-    weekday: 0
-    lookback_days: 7
-    watchlist: watchlist_cache.yaml
-    max_days: 0
-    max_symbols: 0
-    latest_first: true
 ai:
   include_news: true
   include_signals: true
@@ -477,34 +351,5 @@ ai:
 backtest:
   initial_capital: 100000
   cost_bps: 15.0
-  fees:
-    enabled: false
-    commission_bps_buy: 15.0
-    commission_bps_sell: 15.0
-    stamp_duty_bps_sell: 5.0
-    exchange_fee_bps: 0.341
-    regulatory_fee_bps: 0.2
-    transfer_fee_bps: 0.1
   min_history_days: 60
   start_date: '2020-01-01'
-  kpi_targets:
-    annual_return_min_pct: 26
-    annual_return_max_pct: 33
-    max_drawdown_limit_pct: 18
-    sharpe_min: 1.2
-strategy_process:
-  gate_profiles:
-    production:
-      min_expectancy: 0.0
-      max_drawdown_floor_pct: -20.0
-      min_wf_mean_sharpe: 1.0
-      min_wf_sharpe_ok_ratio: 0.55
-      min_wf_folds_required: 3
-      min_stable_ratio: 0.3
-    research:
-      min_expectancy: 0.0
-      max_drawdown_floor_pct: -25.0
-      min_wf_mean_sharpe: 0.7
-      min_wf_sharpe_ok_ratio: 0.45
-      min_wf_folds_required: 3
-      min_stable_ratio: 0.2

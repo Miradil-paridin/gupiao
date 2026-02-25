@@ -92,13 +92,15 @@ class EastmoneyNewsProvider(NewsProvider):
             content = str(row.get("新闻内容", row.get("content", "")))
             pub_time_str = str(row.get("发布时间", row.get("publish_time", "")))
             url = str(row.get("新闻链接", row.get("url", ""))) or None
+            if not title or title.lower() == "nan":
+                continue
             
             pub_time = self._parse_datetime(pub_time_str)
             
             items.append(NewsItem(
                 title=title,
                 content=content[:500] if content else "",  # Truncate long content
-                publish_time=pub_time or datetime.now(),
+                publish_time=pub_time,
                 source=self.name,
                 url=url if url and url != "nan" else None,
                 stock_codes=[code6],
@@ -158,7 +160,7 @@ class EastmoneyNewsProvider(NewsProvider):
             items.append(NewsItem(
                 title=title,
                 content="; ".join(content_parts) if content_parts else "",
-                publish_time=pub_time or datetime.now(),
+                publish_time=pub_time,
                 source=self.name,
                 stock_codes=[code6],
                 category="research",

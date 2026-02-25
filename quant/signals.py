@@ -561,7 +561,7 @@ if __name__ == "__main__":
 
     industry_map = build_industry_map(base_dir / "config.yaml")
     if not industry_map:
-        industry_map = build_industry_map(base_dir / "config_v31.yaml")
+        industry_map = build_industry_map(base_dir / "config.yaml")
 
     ranking = compute_daily_ranking(feats, cfg=cfg, industry_map=industry_map)
     print(ranking[["symbol", "action", "rank", "score", "target_weight"]].head(10))

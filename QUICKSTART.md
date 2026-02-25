@@ -1,139 +1,88 @@
-# 🚀 A股量化助手 - 快速使用指南
+# A股量化项目 Quick Start
 
-## 你每天只需要做的事
+> 与 `README.md` 同步口径。  
+> 这份文档只讲最短可执行路径。
 
-```powershell
-# 每天开盘前运行（约2-3分钟）
-python run_all_daily.py --skip-deepseek
-```
-
-然后查看：`data/signals/latest_daily_rank.csv`
-
-**就这么简单。**
-
----
-
-## 📊 输出文件说明
-
-| 文件 | 位置 | 用途 |
-|------|------|------|
-| **每日信号** | `data/signals/latest_daily_rank.csv` | ⭐ 最重要！告诉你今天该买/卖什么 |
-| AI 报告 | `data/reports/daily_report_*.md` | 简单的 Markdown 汇总 |
-| DeepSeek 报告 | `data/reports/deepseek_report_*.md` | AI 深度分析（可选） |
-
----
-
-## 🎯 如何使用每日信号
-
-打开 `latest_daily_rank.csv`，看这几列：
-
-| 列名 | 含义 | 操作建议 |
-|------|------|---------|
-| `action` | 系统建议 | **INVEST_MORE** = 可以买，**WITHDRAW** = 回避 |
-| `score` | 综合得分 | 越高越好，>2 比较好 |
-| `rank` | 排名 | 1-3 名优先考虑 |
-| `trend_up` | 趋势向上 | 1 = 是，0 = 否，**只买 trend_up=1 的** |
-| `ma_dist_20` | 离20日均线距离 | >5% = 超买别追，<-5% = 可能超卖 |
-
-### 简单操作规则
-
-```
-如果 action = INVEST_MORE 且 trend_up = 1 且 ma_dist_20 < 5%
-  → 可以考虑买入
-  
-如果 action = WITHDRAW 或 trend_up = 0
-  → 不要碰
-```
-
----
-
-## 🤖 什么时候用 DeepSeek AI 报告？
-
-**不是每天都需要！** 只在以下情况运行：
-
-1. 周末复盘时
-2. 有重大新闻/事件时
-3. 想深入分析某只股票时
+## 1. 一次性环境准备
 
 ```powershell
-# 完整流程（包含 DeepSeek，约5-10分钟，消耗 API 额度）
-python run_all_daily.py
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
 ```
 
----
+## 2. 每日运行（推荐）
 
-## ❌ 你不需要关心的文件
-
-- `run_qlib_backtest.py` - 回测用，新手阶段不需要
-- `run_backtest_*.py` - 同上
-- `tools/` 目录 - 开发工具，不用管
-- `data/features/` - 中间数据，不用看
-- `data/raw/` - 原始数据，不用管
-
----
-
-## 📈 因子/指标说明
-
-当前使用的因子：
-
-| 因子 | 含义 | 用途 |
-|------|------|------|
-| `ma_dist_20` | 价格离20日均线的距离 | 判断超买/超卖 |
-| `ret_20d` | 20日收益率 | 短期动量 |
-| `ret_60d` | 60日收益率 | 中期动量 |
-| `vol_20d` | 20日波动率 | 风险指标 |
-| `atr_pct` | ATR百分比 | 波动幅度 |
-| `vol_ratio_20` | 成交量比率 | 量能变化 |
-| `trend_up` | 是否趋势向上 | 趋势判断 |
-| `mom_bad` | 动量是否走坏 | 警告信号 |
-| `risk_high` | 风险是否过高 | 警告信号 |
-
-**这些因子够用吗？**
-
-对于你的目标（月赚 300 SGD）：**够了。**
-
-因子不是越多越好。简单、稳定、可理解的因子 > 复杂的黑箱因子。
-
----
-
-## ⏰ 推荐的每日流程
-
-### 交易日早上 9:00 前
-```powershell
-python run_all_daily.py --skip-deepseek
-```
-查看信号，决定今天的操作
-
-### 周末（可选）
 ```powershell
 python run_all_daily.py
 ```
-查看 DeepSeek 报告，做周复盘
+
+这条命令会按顺序执行：
+
+1. 数据更新与特征构建  
+2. 信号生成  
+3. quick backtest  
+4. 策略治理流程（`strategy_process_pipeline`）  
+5. 读取 `quality_gate` + `failure_monitor`  
+6. 将建议仓位上限自动传给 `run_paper_trading.py`  
+7. 生成日报与仪表盘
+
+## 3. 快速模式（仅做快检查）
+
+```powershell
+python run_all_daily.py --fast
+```
+
+`--fast` 会跳过部分耗时步骤，适合临时检查，不适合完整复盘。
+
+## 4. Gate 相关常用命令
+
+### 4.1 手动跑策略治理
+
+```powershell
+python tools/strategy_process_pipeline.py --base-dir . --max-combos 24 --monitor-days 60
+```
+
+### 4.2 临时忽略 gate（仅调试）
+
+```powershell
+python run_all_daily.py --paper-ignore-gate
+```
+
+不建议长期使用该参数。
+
+## 5. 先看哪些结果
+
+1. 信号：`data/signals/latest_daily_rank.csv`  
+2. 策略治理汇总：`data/backtests/strategy_process_summary.json`  
+3. 策略治理报告：`data/backtests/strategy_process_report.md`  
+4. Paper 状态：`data/paper/state.json`  
+5. Paper 交易：`data/paper/trades.csv`  
+6. Paper 净值：`data/paper/equity.csv`
+
+## 6. 当前判定逻辑（核心）
+
+1. `quality_gate = pass`：正常  
+2. `quality_gate = warn`：降仓（按监控建议 cap）  
+3. `quality_gate = fail` 或 `monitor_action = stop`：强降仓/停机逻辑
+
+## 7. 常见问题
+
+### Q1: 报 `No module named 'baostock'`
+
+```powershell
+.\.venv\Scripts\Activate.ps1
+python -m pip install baostock
+```
+
+### Q2: 想确认今天 gate 结果
+
+直接看：
+
+- `data/backtests/strategy_process_summary.json` 的 `quality_gate`
+- `data/backtests/strategy_process_summary.json` 的 `failure_monitor`
 
 ---
 
-## 🆘 常见问题
+更多背景、当前进度、优化路线图请看 `README.md`。
 
-**Q: 数据抓取失败怎么办？**
-```powershell
-# 重新运行，BaoStock 一般很稳定
-python run_fetch_daily.py
-```
-
-**Q: 如何只看某一天的历史信号？**
-```powershell
-# 查看 data/signals/ 目录下的历史文件
-dir data\signals\
-```
-
-**Q: 如何添加新股票到监控列表？**
-编辑 `config.yaml` 的 `watchlist`
-
----
-
-## 💡 记住
-
-1. **简单就是力量** - 不要追求复杂
-2. **信号只是参考** - 最终决策靠你自己
-3. **控制风险第一** - 单只股票不超过 20% 仓位
-4. **耐心等待** - 没有好信号就空仓
