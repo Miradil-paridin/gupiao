@@ -91,12 +91,29 @@ python run_all_daily.py --skip-backtest-report
 python run_all_daily.py --skip-paper-trade
 python run_all_daily.py --skip-health-card
 python run_all_daily.py --skip-gate-calibration
+python run_all_daily.py --skip-crash-calibration
 ```
 
 ## 3.5 在 run_all_daily 里直接触发新闻回补
 
 ```powershell
 python run_all_daily.py --news-backfill-start 2025-01-01 --news-backfill-end 2026-02-23 --news-backfill-max-days 5 --news-backfill-max-symbols 80 --news-backfill-latest-first
+```
+
+## 3.6 数据后端切换（Parquet / DuckDB）
+
+```powershell
+# 默认兼容模式
+$env:QUANT_DATA_BACKEND='parquet'
+
+# 迁移推荐：双写
+$env:QUANT_DATA_BACKEND='hybrid'
+
+# 先把历史 parquet 灌入 DuckDB
+python run_migrate_market_to_duckdb.py --base-dir .
+
+# 完成后可切纯 DuckDB
+$env:QUANT_DATA_BACKEND='duckdb'
 ```
 
 ---
@@ -136,6 +153,21 @@ python run_generate_gate_calibration.py
 - `data/backtests/strategy_gate_calibration_grid.csv`
 - `data/backtests/strategy_gate_monitor_replay.csv`
 - `data/reports/strategy_gate_calibration_latest.md`
+
+## 4.5 单独生成动量崩盘保护参数校准报告
+
+```powershell
+python run_generate_momentum_crash_calibration.py --base-dir . --config config.yaml
+# 两阶段（含真实回放）示例：
+python run_generate_momentum_crash_calibration.py --base-dir . --config config.yaml --replay-top-k 1 --replay-start-date 2025-01-01
+```
+
+输出：
+- `data/backtests/momentum_crash_calibration.json`
+- `data/backtests/momentum_crash_calibration_grid.csv`
+- `data/backtests/momentum_crash_calibration_replay.csv`
+- `data/backtests/momentum_crash_trigger_log.csv`
+- `data/reports/momentum_crash_calibration_latest.md`
 
 ---
 

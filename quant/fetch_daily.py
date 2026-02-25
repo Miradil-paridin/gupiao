@@ -13,7 +13,7 @@ from tqdm import tqdm
 from .logger import get_logger
 from .normalize import normalize_daily_data
 from .providers import ProviderError, get_provider
-from .store import read_existing_parquet, symbol_paths, write_outputs
+from .store import read_existing_market_daily, symbol_paths, write_outputs
 from .symbols import code_only, normalize_symbol
 
 logger = get_logger("quant.fetch_daily")
@@ -174,6 +174,18 @@ def _compute_fetch_start(
     return max(start, recent_start)
 
 
+def _normalize_date_col(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Normalize date column to pandas Timestamp to avoid mixed datetime/date sorting errors.
+    """
+    if df is None or df.empty or "date" not in df.columns:
+        return df
+    out = df.copy()
+    out["date"] = pd.to_datetime(out["date"], errors="coerce").dt.normalize()
+    out = out.dropna(subset=["date"]).reset_index(drop=True)
+    return out
+
+
 def _fetch_one_symbol(
     base_dir: Path,
     code: str,
@@ -188,7 +200,11 @@ def _fetch_one_symbol(
     symbol = normalize_symbol(code)
     raw_csv, clean_parquet = symbol_paths(base_dir, symbol)
 
-    existing = read_existing_parquet(clean_parquet)
+    existing = read_existing_market_daily(
+        base_dir=base_dir,
+        symbol=symbol,
+        parquet_path=clean_parquet,
+    )
     fetch_start = _compute_fetch_start(start, end, existing, overwrite)
     if fetch_start > end:
         logger.info(f"{symbol} is up-to-date, skipping fetch")
@@ -206,6 +222,8 @@ def _fetch_one_symbol(
             circuit_open=circuit_open,
         )
         new_df = normalize_daily_data(raw_df, symbol=symbol)
+        new_df = _normalize_date_col(new_df)
+        existing = _normalize_date_col(existing)
     except ProviderError as e:
         logger.error(f"Failed to fetch {symbol}: {e}")
         if not existing.empty:
@@ -222,7 +240,7 @@ def _fetch_one_symbol(
             .reset_index(drop=True)
         )
 
-    write_outputs(raw_csv, clean_parquet, out)
+    write_outputs(raw_csv, clean_parquet, out, base_dir=base_dir, symbol=symbol)
     return out
 
 
@@ -334,7 +352,11 @@ def fetch_daily_for_watchlist(
     for code in codes:
         symbol = normalize_symbol(code)
         _, clean_parquet = symbol_paths(base_dir, symbol)
-        existing = read_existing_parquet(clean_parquet)
+        existing = read_existing_market_daily(
+            base_dir=base_dir,
+            symbol=symbol,
+            parquet_path=clean_parquet,
+        )
         if existing.empty:
             new_codes.append(code)
         else:

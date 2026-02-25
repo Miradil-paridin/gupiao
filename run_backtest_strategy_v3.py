@@ -3036,6 +3036,196 @@ def summarize_execution_realism_layer(
     }
 
 
+def _extract_active_windows(
+    dates: pd.Series,
+    active_flags: pd.Series,
+    trigger_flags: pd.Series | None = None,
+    crash_lb_ret: pd.Series | None = None,
+    rebound_lb_ret: pd.Series | None = None,
+) -> list[dict[str, Any]]:
+    if dates is None or active_flags is None or len(dates) == 0:
+        return []
+
+    d = pd.to_datetime(dates)
+    active = pd.Series(active_flags).fillna(False).astype(bool).reset_index(drop=True)
+    trigger = (
+        pd.Series(trigger_flags).fillna(False).astype(bool).reset_index(drop=True)
+        if trigger_flags is not None
+        else pd.Series(False, index=active.index)
+    )
+    crash = (
+        pd.to_numeric(pd.Series(crash_lb_ret), errors="coerce").reset_index(drop=True)
+        if crash_lb_ret is not None
+        else pd.Series(np.nan, index=active.index)
+    )
+    rebound = (
+        pd.to_numeric(pd.Series(rebound_lb_ret), errors="coerce").reset_index(drop=True)
+        if rebound_lb_ret is not None
+        else pd.Series(np.nan, index=active.index)
+    )
+
+    windows: list[dict[str, Any]] = []
+    n = int(len(active))
+    i = 0
+    wid = 0
+    while i < n:
+        if not bool(active.iloc[i]):
+            i += 1
+            continue
+        s = i
+        while i + 1 < n and bool(active.iloc[i + 1]):
+            i += 1
+        e = i
+        seg_trigger_idx = trigger.iloc[s : e + 1][trigger.iloc[s : e + 1]].index.tolist()
+        t_idx = int(seg_trigger_idx[0]) if seg_trigger_idx else int(s)
+        windows.append(
+            {
+                "window_id": int(wid),
+                "start_date": str(d.iloc[s].date()),
+                "end_date": str(d.iloc[e].date()),
+                "days": int(e - s + 1),
+                "trigger_date": str(d.iloc[t_idx].date()),
+                "crash_lb_ret_at_trigger": float(crash.iloc[t_idx]) if np.isfinite(crash.iloc[t_idx]) else None,
+                "rebound_lb_ret_at_trigger": float(rebound.iloc[t_idx]) if np.isfinite(rebound.iloc[t_idx]) else None,
+            }
+        )
+        wid += 1
+        i += 1
+
+    for k in range(len(windows)):
+        if k + 1 < len(windows):
+            end_dt = pd.to_datetime(windows[k]["end_date"])
+            next_start_dt = pd.to_datetime(windows[k + 1]["start_date"])
+            gap = int(max(0, (next_start_dt - end_dt).days - 1))
+            windows[k]["recovery_gap_days_to_next_window"] = int(gap)
+        else:
+            windows[k]["recovery_gap_days_to_next_window"] = None
+    return windows
+
+
+def summarize_momentum_crash_layer(
+    cfg: BacktestConfigV3,
+    regime_df: pd.DataFrame | None,
+    eq: pd.DataFrame | None,
+) -> dict[str, Any]:
+    enabled = bool(cfg.use_momentum_crash_protection)
+    base = {
+        "enabled": enabled,
+        "params": {
+            "crash_lookback_days": int(cfg.momentum_crash_lookback_days),
+            "crash_drop_threshold": float(cfg.momentum_crash_drop_threshold),
+            "rebound_lookback_days": int(cfg.momentum_rebound_lookback_days),
+            "rebound_threshold": float(cfg.momentum_rebound_threshold),
+            "protection_days": int(cfg.momentum_crash_protection_days),
+            "position_cap": float(cfg.momentum_crash_position_cap),
+        },
+    }
+    if not enabled:
+        return {
+            **base,
+            "status": "disabled",
+            "window_count": 0,
+            "trigger_count": 0,
+            "active_days": 0,
+            "active_day_ratio": 0.0,
+            "windows": [],
+            "recovery_conditions": ["崩盘保护未启用。"],
+        }
+    if regime_df is None or regime_df.empty:
+        return {
+            **base,
+            "status": "no_data",
+            "window_count": 0,
+            "trigger_count": 0,
+            "active_days": 0,
+            "active_day_ratio": 0.0,
+            "windows": [],
+            "recovery_conditions": ["缺少市场状态数据，无法评估崩盘保护触发。"],
+        }
+
+    rr = regime_df.copy()
+    rr["date"] = pd.to_datetime(rr["date"])
+    rr = rr.sort_values("date").reset_index(drop=True)
+    active = pd.to_numeric(rr.get("momentum_crash_active", False), errors="coerce").fillna(0).astype(bool)
+    trigger = pd.to_numeric(rr.get("momentum_crash_trigger", 0), errors="coerce").fillna(0).astype(int).gt(0)
+    crash_lb = pd.to_numeric(rr.get("crash_lb_ret", np.nan), errors="coerce")
+    rebound_lb = pd.to_numeric(rr.get("rebound_lb_ret", np.nan), errors="coerce")
+
+    windows = _extract_active_windows(
+        dates=rr["date"],
+        active_flags=active,
+        trigger_flags=trigger,
+        crash_lb_ret=crash_lb,
+        rebound_lb_ret=rebound_lb,
+    )
+    total_days = max(1, int(len(rr)))
+    active_days = int(active.sum())
+    trigger_count = int(trigger.sum())
+    active_ratio = float(active_days / total_days)
+
+    active_ret_mean = 0.0
+    inactive_ret_mean = 0.0
+    active_ret_sharpe = 0.0
+    inactive_ret_sharpe = 0.0
+    if eq is not None and (not eq.empty) and ("date" in eq.columns) and ("daily_return" in eq.columns):
+        ee = eq[["date", "daily_return"]].copy()
+        ee["date"] = pd.to_datetime(ee["date"])
+        ee["daily_return"] = pd.to_numeric(ee["daily_return"], errors="coerce").fillna(0.0)
+        mm = rr[["date"]].copy()
+        mm["active"] = active.values
+        merged = ee.merge(mm, on="date", how="inner")
+        if not merged.empty:
+            act_r = pd.to_numeric(merged.loc[merged["active"], "daily_return"], errors="coerce").fillna(0.0)
+            inact_r = pd.to_numeric(merged.loc[~merged["active"], "daily_return"], errors="coerce").fillna(0.0)
+            active_ret_mean = float(act_r.mean()) if len(act_r) > 0 else 0.0
+            inactive_ret_mean = float(inact_r.mean()) if len(inact_r) > 0 else 0.0
+            active_ret_sharpe = _sharpe(act_r) if len(act_r) > 1 else 0.0
+            inactive_ret_sharpe = _sharpe(inact_r) if len(inact_r) > 1 else 0.0
+
+    gap_vals = [
+        int(w.get("recovery_gap_days_to_next_window"))
+        for w in windows
+        if w.get("recovery_gap_days_to_next_window") is not None
+    ]
+    recovery_p50 = int(np.median(gap_vals)) if gap_vals else None
+    recovery_p75 = int(np.percentile(gap_vals, 75)) if gap_vals else None
+
+    if trigger_count == 0:
+        status = "idle"
+    elif active_ratio > 0.35:
+        status = "warning"
+    elif trigger_count >= 15:
+        status = "watch"
+    else:
+        status = "ok"
+
+    hold_n = max(2, min(6, int(cfg.momentum_crash_protection_days)))
+    recovery_conditions = [
+        f"连续 {hold_n} 天无新触发。",
+        f"crash_lb_ret 回升至 {float(cfg.momentum_crash_drop_threshold) * 0.5:+.2%} 以上。",
+        f"rebound_lb_ret 回落到 {float(cfg.momentum_rebound_threshold):+.2%} 以下。",
+    ]
+    if recovery_p50 is not None:
+        recovery_conditions.append(f"历史中位恢复间隔约 {int(recovery_p50)} 天（P75={int(recovery_p75 or recovery_p50)} 天）。")
+
+    return {
+        **base,
+        "status": status,
+        "window_count": int(len(windows)),
+        "trigger_count": trigger_count,
+        "active_days": active_days,
+        "active_day_ratio": active_ratio,
+        "active_return_mean": active_ret_mean,
+        "inactive_return_mean": inactive_ret_mean,
+        "active_return_sharpe": active_ret_sharpe,
+        "inactive_return_sharpe": inactive_ret_sharpe,
+        "recovery_gap_p50_days": recovery_p50,
+        "recovery_gap_p75_days": recovery_p75,
+        "windows": windows,
+        "recovery_conditions": recovery_conditions,
+    }
+
+
 def summarize_stability_layer(
     eq: pd.DataFrame,
     wf_stability_summary: dict[str, Any] | None = None,
@@ -3098,6 +3288,7 @@ def build_three_layer_evaluation(
     trades: list[dict[str, Any]],
     wf_stability_summary: dict[str, Any] | None = None,
     parallel_results: dict[str, dict[str, Any]] | None = None,
+    momentum_crash_layer: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     layer1_status = "ok" if bool(kpi_status.get("all_ok", False)) else "warning"
     layer1 = {
@@ -3117,10 +3308,18 @@ def build_three_layer_evaluation(
         },
     }
     layer2 = summarize_execution_realism_layer(eq, trades, cfg, parallel_results=parallel_results)
+    layer2b = momentum_crash_layer or {"status": "no_data", "enabled": bool(cfg.use_momentum_crash_protection)}
     layer3 = summarize_stability_layer(eq, wf_stability_summary=wf_stability_summary)
 
-    statuses = [str(layer1.get("status", "")), str(layer2.get("status", "")), str(layer3.get("status", ""))]
+    statuses = [
+        str(layer1.get("status", "")),
+        str(layer2.get("status", "")),
+        str(layer2b.get("status", "")),
+        str(layer3.get("status", "")),
+    ]
     if "warning" in statuses:
+        overall = "warning"
+    elif "watch" in statuses:
         overall = "warning"
     elif "no_data" in statuses:
         overall = "partial"
@@ -3139,6 +3338,7 @@ def build_three_layer_evaluation(
         "period_end": period_end,
         "layer_1_backtest": layer1,
         "layer_2_execution": layer2,
+        "layer_2b_momentum_crash": layer2b,
         "layer_3_stability": layer3,
     }
 
@@ -3146,6 +3346,7 @@ def build_three_layer_evaluation(
 def render_three_layer_report_md(three_layer: dict[str, Any]) -> str:
     l1 = three_layer.get("layer_1_backtest", {})
     l2 = three_layer.get("layer_2_execution", {})
+    l2b = three_layer.get("layer_2b_momentum_crash", {})
     l3 = three_layer.get("layer_3_stability", {})
     m1 = l1.get("metrics", {})
     kpi = l1.get("kpi_status", {})
@@ -3188,6 +3389,15 @@ def render_three_layer_report_md(three_layer: dict[str, Any]) -> str:
         f"{float(l2.get('total_explicit_cost_pct', 0.0)):.3f}%/"
         f"{float(l2.get('total_extra_exec_cost_pct', 0.0)):.3f}%/"
         f"{float(l2.get('total_cost_pct', 0.0)):.3f}%",
+        "",
+        "## Layer 2B - Momentum Crash Protection",
+        f"- Status: {l2b.get('status', 'unknown')}",
+        f"- Enabled: {bool(l2b.get('enabled', False))}",
+        f"- Trigger count: {int(l2b.get('trigger_count', 0))}",
+        f"- Active days / ratio: {int(l2b.get('active_days', 0))} / {float(l2b.get('active_day_ratio', 0.0)) * 100.0:.1f}%",
+        f"- Window count: {int(l2b.get('window_count', 0))}",
+        f"- Active return mean: {float(l2b.get('active_return_mean', 0.0)) * 100.0:+.3f}%",
+        f"- Inactive return mean: {float(l2b.get('inactive_return_mean', 0.0)) * 100.0:+.3f}%",
         "",
         "## Layer 3 - Stability",
         f"- Status: {l3.get('status', 'unknown')}",
@@ -5022,6 +5232,31 @@ def run_quick_backtest(
     eq_out.parent.mkdir(parents=True, exist_ok=True)
     eq.to_csv(eq_out, index=False, encoding="utf-8-sig")
 
+    regime_snapshot_out = base_dir / "data" / "backtests" / "backtest_strategy_v3_market_regime_snapshot.csv"
+    if regime_df is not None and not regime_df.empty:
+        regime_cols = [
+            "date",
+            "market_ret_1d",
+            "market_ret_20d",
+            "market_trend_pct",
+            "regime",
+            "regime_pos_cap",
+            "market_vol_annual",
+            "volatility_pos_mult",
+            "market_liq_proxy",
+            "liquidity_pos_mult",
+            "state_pos_mult",
+            "crash_lb_ret",
+            "rebound_lb_ret",
+            "momentum_crash_trigger",
+            "momentum_crash_active",
+            "momentum_crash_pos_cap",
+        ]
+        rr = regime_df.copy()
+        keep_cols = [c for c in regime_cols if c in rr.columns]
+        if keep_cols:
+            rr[keep_cols].to_csv(regime_snapshot_out, index=False, encoding="utf-8-sig")
+
     # 娣囨繂鐡ㄦ禍銈嗘鐠佹澘缍?
     if trades:
         trades_out = base_dir / "data" / "backtests" / "backtest_strategy_v3_trades.csv"
@@ -5054,6 +5289,16 @@ def run_quick_backtest(
         compare_df.to_csv(compare_out, index=False, encoding="utf-8-sig")
         print(f"  [Execution Compare] {compare_out}")
 
+    momentum_crash_layer = summarize_momentum_crash_layer(cfg=cfg, regime_df=regime_df, eq=eq)
+    crash_summary_out = base_dir / "data" / "backtests" / "backtest_strategy_v3_momentum_crash_summary.json"
+    crash_summary_out.write_text(json.dumps(momentum_crash_layer, ensure_ascii=False, indent=2), encoding="utf-8")
+    crash_log_out = base_dir / "data" / "backtests" / "backtest_strategy_v3_momentum_crash_log.csv"
+    crash_windows = momentum_crash_layer.get("windows", [])
+    if isinstance(crash_windows, list) and crash_windows:
+        pd.DataFrame(crash_windows).to_csv(crash_log_out, index=False, encoding="utf-8-sig")
+    elif crash_log_out.exists():
+        crash_log_out.unlink()
+
     three_layer = build_three_layer_evaluation(
         cfg=cfg,
         metrics=m,
@@ -5062,6 +5307,7 @@ def run_quick_backtest(
         trades=trades,
         wf_stability_summary=wf_stability_summary,
         parallel_results=parallel_results,
+        momentum_crash_layer=momentum_crash_layer,
     )
     three_layer_out = base_dir / "data" / "backtests" / "backtest_strategy_v3_three_layer_report.json"
     three_layer_out.write_text(json.dumps(three_layer, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -5090,6 +5336,7 @@ def run_quick_backtest(
         }
     if wf_stability_summary:
         stats_payload["walk_forward_stability"] = wf_stability_summary
+    stats_payload["momentum_crash_protection"] = momentum_crash_layer
     stats_out.write_text(json.dumps(stats_payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
     if run_walk_forward and not wf_df.empty:
@@ -5103,6 +5350,9 @@ def run_quick_backtest(
     print(f"\n{'=' * 60}")
     print("📌 回测结果汇总")
     print(f"  输出文件 {eq_out}")
+    if regime_snapshot_out.exists():
+        print(f"  市场状态快照 {regime_snapshot_out}")
+    print(f"  崩盘保护汇总 {crash_summary_out}")
     print(f"  回测区间 {start_date} 至 {eq['date'].max() if not eq.empty else 'N/A'}")
     print(f"  指标 年化{m['annual_return_pct']:+.2f}% | 最大回撤{m['max_drawdown_pct']:.2f}% | Sharpe {m['sharpe']:.2f}")
     print(f"{'=' * 60}")

@@ -19,6 +19,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from .store import load_market_daily_all_from_backend
+
 
 # =============================================================================
 # 原有函数（保持不变）
@@ -52,7 +54,9 @@ def load_market_daily_all(base_dir: Path) -> pd.DataFrame:
     elif clean_max is not None:
         df = pd.read_parquet(clean_path)
     else:
-        raise FileNotFoundError("No market_daily_all parquet found (qc or clean).")
+        df = load_market_daily_all_from_backend(base_dir)
+        if df is None or df.empty:
+            raise FileNotFoundError("No market_daily_all data found (qc/clean parquet or duckdb).")
 
     if df is None or df.empty:
         raise RuntimeError("Loaded market data is empty.")

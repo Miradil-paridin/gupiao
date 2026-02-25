@@ -10,6 +10,7 @@ import yaml
 
 from quant.fetch_daily import fetch_daily_for_watchlist
 from quant.logger import setup_logger
+from quant.store import duckdb_status
 
 # Hard-disable proxies for this process.
 for k in [
@@ -99,9 +100,15 @@ def main() -> None:
 
     logger.info(f"Starting daily data fetch for {len(codes)} symbols")
     logger.info(f"Primary provider: {primary_provider}, Fallback: {fallback_providers}")
+    backend_info = duckdb_status(base_dir)
     print(f"Socket timeout: {socket_timeout:.1f}s")
     print(f"Symbols: {len(codes)}")
     print(f"Providers: {primary_provider} + {fallback_providers}")
+    print(
+        "Data backend: "
+        f"{backend_info['backend']} "
+        f"(duckdb_enabled={backend_info['duckdb_enabled']}, db={backend_info['duckdb_path']})"
+    )
 
     combined = fetch_daily_for_watchlist(
         base_dir=base_dir,

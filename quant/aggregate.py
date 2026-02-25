@@ -3,6 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 import pandas as pd
 
+from .store import load_market_daily_all_from_backend
+
 
 def build_market_daily_all(base_dir: Path) -> pd.DataFrame:
     """
@@ -11,29 +13,31 @@ def build_market_daily_all(base_dir: Path) -> pd.DataFrame:
     Merge them into one dataframe and write:
       data/clean/market_daily_all.parquet
     """
-    in_dir = base_dir / "data" / "clean" / "market_daily"
     out_path = base_dir / "data" / "clean" / "market_daily_all.parquet"
+    in_dir = base_dir / "data" / "clean" / "market_daily"
 
-    if not in_dir.exists():
-        raise FileNotFoundError(f"Input folder not found: {in_dir}")
+    all_df = load_market_daily_all_from_backend(base_dir)
+    if all_df is None or all_df.empty:
+        if not in_dir.exists():
+            raise FileNotFoundError(f"Input folder not found: {in_dir}")
 
-    files = sorted(in_dir.glob("*.parquet"))
-    if not files:
-        raise FileNotFoundError(f"No parquet files found in: {in_dir}")
+        files = sorted(in_dir.glob("*.parquet"))
+        if not files:
+            raise FileNotFoundError(f"No parquet files found in: {in_dir}")
 
-    dfs: list[pd.DataFrame] = []
-    for fp in files:
-        df = pd.read_parquet(fp)
-        if df is None or df.empty:
-            continue
-        # Normalize date type
-        df["date"] = pd.to_datetime(df["date"]).dt.date
-        dfs.append(df)
+        dfs: list[pd.DataFrame] = []
+        for fp in files:
+            df = pd.read_parquet(fp)
+            if df is None or df.empty:
+                continue
+            # Normalize date type
+            df["date"] = pd.to_datetime(df["date"]).dt.date
+            dfs.append(df)
 
-    if not dfs:
-        raise RuntimeError("No data loaded (all files empty?)")
+        if not dfs:
+            raise RuntimeError("No data loaded (all files empty?)")
+        all_df = pd.concat(dfs, ignore_index=True)
 
-    all_df = pd.concat(dfs, ignore_index=True)
     all_df = (
         all_df.drop_duplicates(["symbol", "date"], keep="last")
              .sort_values(["symbol", "date"])

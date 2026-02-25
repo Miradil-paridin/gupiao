@@ -333,6 +333,7 @@ def main() -> None:
     ap.add_argument("--skip-md", action="store_true", help="跳过Markdown日报")
     ap.add_argument("--skip-health-card", action="store_true", help="跳过策略健康诊断卡")
     ap.add_argument("--skip-gate-calibration", action="store_true", help="跳过闸门阈值校准报告")
+    ap.add_argument("--skip-crash-calibration", action="store_true", help="跳过动量崩盘保护参数校准")
     ap.add_argument("--skip-backtest-report", action="store_true", help="跳过回测HTML报告")
     ap.add_argument("--skip-charts", action="store_true", help="跳过图表生成（加速）")
     ap.add_argument("--fast", action="store_true", help="快速模式（跳过新闻+图表+AI增强）")
@@ -432,6 +433,7 @@ def main() -> None:
         args.skip_backtest = True
         args.skip_backtest_report = True
         args.skip_strategy_process = True
+        args.skip_crash_calibration = True
         print("⚡ 快速模式: 跳过新闻+图表+回测报告")
 
     # 环境变量
@@ -696,6 +698,25 @@ def main() -> None:
     else:
         print("⏭️ 跳过: run_generate_gate_calibration.py")
 
+    # 动量崩盘保护参数校准（drop/rebound/protection_days/position_cap）
+    if not args.skip_crash_calibration:
+        if (base_dir / "run_generate_momentum_crash_calibration.py").exists():
+            equity_path = base_dir / "data" / "backtests" / "backtest_strategy_v3_equity.csv"
+            if equity_path.exists():
+                run_step(
+                    base_dir,
+                    "run_generate_momentum_crash_calibration.py",
+                    env=env,
+                    extra_args=["--as-of", as_of, "--config", str(cfg_path)],
+                )
+                steps_run.append("动量崩盘校准")
+            else:
+                print("⏭️ 跳过: run_generate_momentum_crash_calibration.py (缺少回测净值文件)")
+        else:
+            print("⏭️ 跳过: run_generate_momentum_crash_calibration.py (文件不存在)")
+    else:
+        print("⏭️ 跳过: run_generate_momentum_crash_calibration.py")
+
     # AI研报（使用优化版 v2）
     if not args.skip_ai:
         candidate_scripts = ["run_ai_report_v2.py", "run_ai_report.py"]
@@ -781,6 +802,12 @@ def main() -> None:
         ("闸门校准报告", f"data/reports/strategy_gate_calibration_{report_date}.md"),
         ("闸门校准报告(最新)", "data/reports/strategy_gate_calibration_latest.md"),
         ("闸门校准汇总JSON", "data/backtests/strategy_gate_calibration.json"),
+        ("崩盘校准报告", f"data/reports/momentum_crash_calibration_{report_date}.md"),
+        ("崩盘校准报告(最新)", "data/reports/momentum_crash_calibration_latest.md"),
+        ("崩盘校准汇总JSON", "data/backtests/momentum_crash_calibration.json"),
+        ("崩盘校准网格", "data/backtests/momentum_crash_calibration_grid.csv"),
+        ("崩盘校准回放", "data/backtests/momentum_crash_calibration_replay.csv"),
+        ("崩盘触发日志", "data/backtests/momentum_crash_trigger_log.csv"),
         ("AI研报", f"data/reports/ai_report_{report_date}.md"),
         ("AI研报(最新)", "out/latest_ai_report.md"),
         ("AI研报仪表盘", "out/ai_report_dashboard.html"),

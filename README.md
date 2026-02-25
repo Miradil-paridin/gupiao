@@ -95,6 +95,11 @@
 - 已完成新增日期：`2025-01-21/22/23/24/27`（以及此前已有日期）。  
 - 在 `2025-01-01 ~ 2026-02-23` 区间内，当前有 `manifest` 的交易日约 `17` 天，剩余约 `256` 天待补（按当前本地数据口径统计）。
 
+6. 动量崩盘保护参数校准已接入  
+- 新增脚本：`run_generate_momentum_crash_calibration.py`。  
+- `run_all_daily.py` 已接入该步骤，可用 `--skip-crash-calibration` 跳过。  
+- 产出“两阶段”校准结果（网格近似 + TopK 真实回放）、触发窗口日志与最新校准报告，便于冻结生产参数。
+
 ---
 
 ## 3. 当前默认策略口径（config.yaml，v31 为可切换基线）
@@ -139,6 +144,28 @@ python run_all_daily.py --paper-ignore-gate
 python run_all_daily.py --config config_v31.yaml
 ```
 
+### 4.5 单独生成动量崩盘保护参数校准报告
+
+```bash
+python run_generate_momentum_crash_calibration.py --base-dir . --config config.yaml
+# 两阶段（含真实回放）示例：
+python run_generate_momentum_crash_calibration.py --base-dir . --config config.yaml --replay-top-k 1 --replay-start-date 2025-01-01
+```
+
+### 4.6 数据后端（Parquet / DuckDB）
+
+```bash
+# 默认（兼容旧流程）
+$env:QUANT_DATA_BACKEND='parquet'
+
+# 双写模式（推荐迁移期）
+$env:QUANT_DATA_BACKEND='hybrid'
+
+# 纯 DuckDB（确认兼容后再启用）
+$env:QUANT_DATA_BACKEND='duckdb'
+python run_migrate_market_to_duckdb.py --base-dir .
+```
+
 ---
 
 ## 5. 主要输出文件
@@ -153,6 +180,12 @@ python run_all_daily.py --config config_v31.yaml
 - 闸门阈值校准：`data/backtests/strategy_gate_calibration.json`
 - 闸门阈值校准网格：`data/backtests/strategy_gate_calibration_grid.csv`
 - 闸门阈值校准报告：`data/reports/strategy_gate_calibration_latest.md`
+- 动量崩盘校准：`data/backtests/momentum_crash_calibration.json`
+- 动量崩盘校准网格：`data/backtests/momentum_crash_calibration_grid.csv`
+- 动量崩盘校准回放：`data/backtests/momentum_crash_calibration_replay.csv`
+- 动量崩盘触发日志：`data/backtests/momentum_crash_trigger_log.csv`
+- 动量崩盘校准报告：`data/reports/momentum_crash_calibration_latest.md`
+- DuckDB 主库（启用后）：`data/quant.db`
 - Paper 状态：`data/paper/state.json`
 - Paper 交易：`data/paper/trades.csv`
 - Paper 净值：`data/paper/equity.csv`
