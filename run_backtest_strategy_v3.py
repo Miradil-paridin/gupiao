@@ -5363,7 +5363,7 @@ def main() -> None:
     ap.add_argument("--base-dir", default=".", help="project root")
     ap.add_argument(
         "--preset",
-        choices=["default", "target25"],
+        choices=["default", "target25", "real"],
         default="default",
         help="quick preset for common workflows",
     )
@@ -5537,6 +5537,26 @@ def main() -> None:
             if not args.enable_index_filter and not args.disable_index_filter:
                 args.disable_index_filter = True
             print("  Preset active: target25 (full-universe dynamic pool, index filter off, SL/TS=9%/12%)")
+        elif args.preset == "real":
+            # Real-trading oriented preset: keep a broad dynamic universe and
+            # mild stops, avoid over-tight risk gates that historically
+            # collapsed return in this project.
+            if args.watchlist is None:
+                args.no_default_watchlist = True
+            if not bool(args.dynamic_watchlist):
+                args.dynamic_watchlist = True
+            if int(args.dynamic_top_n) < 1000:
+                args.dynamic_top_n = 1000
+            if args.stop_loss_pct is None:
+                args.stop_loss_pct = 0.09
+            if args.trailing_stop_pct is None:
+                args.trailing_stop_pct = 0.11
+            if not args.enable_index_filter and not args.disable_index_filter:
+                args.disable_index_filter = True
+            print(
+                "  Preset active: real "
+                "(dynamic Top1000, index filter off, SL/TS=9%/11%)"
+            )
 
         wl_file = args.watchlist
         if wl_file is None and not args.no_default_watchlist:

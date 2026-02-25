@@ -161,11 +161,16 @@ def resolve_config_path(base_dir: Path, config_arg: str = "") -> Path:
         if p.exists():
             return p
 
+    local_cfg = base_dir / "config_local.yaml"
+    if local_cfg.exists():
+        print("  ✅ 检测到 config_local.yaml，优先使用本地覆盖配置")
+        return local_cfg
+
     for name in ["config.yaml", "config_v31.yaml"]:
         p = base_dir / name
         if p.exists():
             return p
-    raise FileNotFoundError("no config file found (expected config.yaml or config_v31.yaml)")
+    raise FileNotFoundError("no config file found (expected config_local.yaml/config.yaml/config_v31.yaml)")
 
 
 def load_config(cfg_path: Path) -> dict:
@@ -246,6 +251,57 @@ def get_news_symbols(base_dir: Path, top_n: int = 30) -> list[str]:
         return symbols
     except Exception:
         return []
+
+
+def _normalize_symbol_code(code: object) -> str:
+    s = str(code or "").strip().upper()
+    if not s:
+        return ""
+    if "." in s:
+        s = s.split(".", 1)[0].strip()
+    digits = "".join(ch for ch in s if ch.isdigit())
+    if not digits:
+        return ""
+    if len(digits) <= 6:
+        return digits.zfill(6)
+    return digits[-6:]
+
+
+def _dedup_symbols(symbols: list[str]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in symbols:
+        s = _normalize_symbol_code(raw)
+        if not s or s in seen:
+            continue
+        seen.add(s)
+        out.append(s)
+    return out
+
+
+def _load_symbols_from_watchlist_file(path: Path) -> list[str]:
+    if not path.exists():
+        return []
+    try:
+        raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return []
+
+    if isinstance(raw, list):
+        return _dedup_symbols([str(x) for x in raw])
+    if isinstance(raw, dict):
+        for k in ["watchlist", "symbols", "stocks", "codes"]:
+            v = raw.get(k)
+            if isinstance(v, list):
+                return _dedup_symbols([str(x) for x in v])
+    return []
+
+
+def _symbols_from_config_watchlist(cfg: dict) -> list[str]:
+    wl = cfg.get("watchlist", [])
+    if isinstance(wl, list):
+        return _dedup_symbols([str(x) for x in wl])
+    return []
 
 
 def get_llm_provider() -> str:
@@ -337,10 +393,31 @@ def main() -> None:
     ap.add_argument("--skip-backtest-report", action="store_true", help="跳过回测HTML报告")
     ap.add_argument("--skip-charts", action="store_true", help="跳过图表生成（加速）")
     ap.add_argument("--fast", action="store_true", help="快速模式（跳过新闻+图表+AI增强）")
-    ap.add_argument("--config", default="", help="config path (default: config.yaml, fallback: config_v31.yaml)")
+    ap.add_argument(
+        "--config",
+        default="",
+        help="config path (default: config_local.yaml > config.yaml, fallback: config_v31.yaml)",
+    )
     ap.add_argument("--as-of", default="", help="指定日期 (YYYY-MM-DD)")
     ap.add_argument("--disable-proxy", action="store_true", help="禁用代理")
     ap.add_argument("--news-top-n", type=int, default=30, help="新闻只抓信号排名前N的股票 (默认30)")
+    ap.add_argument(
+        "--news-scope",
+        choices=["rank_topn", "watchlist", "rank_plus_watchlist"],
+        default="",
+        help="news symbol scope (default from config: rank_topn)",
+    )
+    ap.add_argument(
+        "--news-watchlist",
+        default="",
+        help="watchlist file used when news scope includes watchlist (default: watchlist_cache.yaml)",
+    )
+    ap.add_argument(
+        "--news-max-symbols",
+        type=int,
+        default=0,
+        help="cap symbols passed to news fetch (0 means no cap)",
+    )
     ap.add_argument("--news-backfill-start", default="", help="新闻历史回补开始日期 YYYY-MM-DD（可选）")
     ap.add_argument("--news-backfill-end", default="", help="新闻历史回补结束日期 YYYY-MM-DD（默认=as_of）")
     ap.add_argument("--news-backfill-watchlist", default="", help="新闻历史回补股票池文件（默认 watchlist_cache.yaml）")
@@ -357,6 +434,12 @@ def main() -> None:
         "--backtest-watchlist",
         default="",
         help="watchlist file for quick backtest (auto: watchlist_cache.yaml -> backtest_watchlist.yaml)",
+    )
+    ap.add_argument(
+        "--backtest-preset",
+        choices=["default", "target25", "real"],
+        default="default",
+        help="preset forwarded to run_backtest_strategy_v3.py",
     )
     ap.add_argument("--backtest-top-n", type=int, default=300, help="dynamic top_n for quick backtest")
     ap.add_argument("--backtest-walk-forward", action="store_true", help="enable walk-forward in quick backtest")
@@ -421,10 +504,18 @@ def main() -> None:
     news_cfg = cfg.get("news", {}) or {}
     if news_cfg.get("news_top_n"):
         news_top_n = int(news_cfg["news_top_n"])
+    news_scope = str(args.news_scope or news_cfg.get("symbol_scope", "rank_topn")).strip().lower()
+    if news_scope not in {"rank_topn", "watchlist", "rank_plus_watchlist"}:
+        news_scope = "rank_topn"
+    news_watchlist = str(args.news_watchlist or news_cfg.get("watchlist", "watchlist_cache.yaml")).strip()
+    news_max_symbols = int(args.news_max_symbols) if int(args.news_max_symbols) > 0 else int(news_cfg.get("max_symbols", 0) or 0)
     news_backfill_cfg = news_cfg.get("backfill", {}) if isinstance(news_cfg.get("backfill", {}), dict) else {}
 
     print(f"📊 股票池: {n_watchlist} 只")
-    print(f"📰 新闻覆盖: 信号前 {news_top_n} 只 + 市场新闻")
+    print(
+        f"📰 新闻覆盖设置: scope={news_scope}, top_n={news_top_n}, "
+        f"max_symbols={news_max_symbols if news_max_symbols > 0 else '∞'}"
+    )
 
     # 快速模式
     if args.fast:
@@ -525,8 +616,33 @@ def main() -> None:
     n_news_symbols = 0
     do_news = (not args.skip_news) and include_news_cfg
     if do_news:
-        # 获取需要抓新闻的股票
-        news_symbols = get_news_symbols(base_dir, top_n=news_top_n)
+        rank_symbols: list[str] = []
+        watchlist_symbols: list[str] = []
+
+        if news_scope in {"rank_topn", "rank_plus_watchlist"}:
+            rank_symbols = _dedup_symbols(get_news_symbols(base_dir, top_n=news_top_n))
+
+        if news_scope in {"watchlist", "rank_plus_watchlist"}:
+            wl_path = None
+            if news_watchlist:
+                cand = Path(news_watchlist)
+                if not cand.is_absolute():
+                    cand = base_dir / cand
+                wl_path = cand
+            if wl_path and wl_path.exists():
+                watchlist_symbols = _load_symbols_from_watchlist_file(wl_path)
+            else:
+                watchlist_symbols = _symbols_from_config_watchlist(cfg)
+
+        if news_scope == "watchlist":
+            news_symbols = watchlist_symbols
+        elif news_scope == "rank_plus_watchlist":
+            news_symbols = _dedup_symbols(rank_symbols + watchlist_symbols)
+        else:
+            news_symbols = rank_symbols
+
+        if news_max_symbols > 0:
+            news_symbols = news_symbols[:news_max_symbols]
         n_news_symbols = len(news_symbols)
 
         env2 = env.copy()
@@ -534,7 +650,12 @@ def main() -> None:
         # 将新闻股票列表传给新闻脚本（通过环境变量）
         if news_symbols:
             env2["NEWS_SYMBOLS"] = ",".join(news_symbols)
-            print(f"  📰 新闻覆盖: {n_news_symbols} 只信号股 + 市场新闻")
+        print(
+            f"  📰 新闻覆盖: scope={news_scope}, symbols={n_news_symbols}, "
+            f"rank={len(rank_symbols)}, watchlist={len(watchlist_symbols)}"
+        )
+        if news_scope in {"watchlist", "rank_plus_watchlist"} and news_watchlist:
+            print(f"  🧾 新闻股票池来源: {news_watchlist}")
 
         run_step(base_dir, "run_fetch_news.py", env=env2)
         steps_run.append("新闻抓取")
@@ -549,7 +670,7 @@ def main() -> None:
 
     # Refresh backtest stats/equity before report generation.
     pipeline_watchlist = args.backtest_watchlist.strip()
-    if not pipeline_watchlist:
+    if not pipeline_watchlist and args.backtest_preset == "default":
         for cand in ["watchlist_cache.yaml", "backtest_watchlist.yaml"]:
             if (base_dir / cand).exists():
                 pipeline_watchlist = cand
@@ -566,6 +687,7 @@ def main() -> None:
             "--base-dir", ".",
             "--config", str(cfg_path),
             "--start-date", bt_start,
+            "--preset", str(args.backtest_preset),
             "--dynamic-watchlist",
             "--dynamic-top-n", str(int(args.backtest_top_n)),
         ]
