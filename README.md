@@ -299,6 +299,17 @@ python run_migrate_market_to_duckdb.py --base-dir .
 5. 会话 E（运行文档）  
 - 已补充 `RUNBOOK.md`，覆盖每日/每周运行命令与常用参数。
 
+6. 会话 F（回测预设与口径统一，2026-02-25）  
+- 在 `run_backtest_strategy_v3.py` 增加 `--preset real`，当前预设为 `default / target25 / real`。  
+- 在 `run_all_daily.py` 增加 `--backtest-preset` 并透传到回测脚本，避免“日跑口径”和“手工回测口径”不一致。  
+- `run_all_daily.py` 现在支持 `config_local.yaml` 自动优先（优先级低于 `--config` 与 `PIPELINE_CONFIG`）。
+
+7. 会话 G（新闻覆盖与单变量实测，2026-02-25）  
+- 在 `run_all_daily.py` 增加新闻覆盖控制：`--news-scope`、`--news-watchlist`、`--news-max-symbols`。  
+- `--news-scope` 支持 `rank_topn / watchlist / rank_plus_watchlist`，用于先做覆盖率再评估新闻因子权重。  
+- 按“每次只改 1 项”的方法完成 4 组单变量回测（flow / neutral_cap / target_annual / industry_rs），结果均未超过基线，全部回滚。  
+- 当前基线口径（`target25`）仍是最优：年化约 `26.53%`、MaxDD 约 `-15.32%`、Sharpe 约 `1.44`（数据区间到 2026-02-24）。
+
 注：会话中提到的收益指标以对应回测输出文件为准，不同股票池、日期区间、成本参数会导致结果差异。
 
 ---
@@ -321,3 +332,16 @@ pip install -r requirements.txt
 2. 回测结果不代表未来收益，尤其在结构切换阶段。  
 3. 实盘前必须保留风控闸门，不建议关闭。  
 4. 任何新增策略都应先过样本外和稳定区，再考虑纳入主流程。
+
+---
+
+## 12. 当前推荐运行命令（2026-02-25）
+
+1. 日常全流程（固定高收益口径 + 新闻覆盖增强）  
+`python run_all_daily.py --config config.yaml --backtest-preset target25 --news-scope rank_plus_watchlist --news-watchlist watchlist_cache.yaml --news-max-symbols 300`
+
+2. 复现实测基线回测（最稳定对照口径）  
+`python run_backtest_strategy_v3.py --preset target25 --start-date 2020-01-01`
+
+3. 查看最接近实盘表现  
+查看 `data/paper/equity.csv`（连续运行 14-28 个交易日后再评估年化与回撤）。
